@@ -1,19 +1,12 @@
-**/build/
-**/.git/
-**/.vscode/
-**/.gemini/
-build/
-.git/
-.vscode/
-.gemini/
-api_server
-converter
-debug_one
-*.o
-*.a
-*.so
-# Ignore root binaries, but keep them in the resources folder
-*.bin
-*.json
-!resources/*.bin
-!resources/*.json
+# Ignore everything
+*
+
+# Keep only essential files
+!src/
+!src/**
+!resources/
+!resources/**
+!CMakeLists.txt
+!Makefile
+!.dockerignore
+!Dockerfile

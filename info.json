@@ -1,0 +1,7 @@
+{
+    "participants": ["Dalvo Rienda"],
+    "social": ["https://github.com/dalvorsn", "https://www.linkedin.com/in/dalvorsn"],
+    "source-code-repo": "https://github.com/dalvorsn/cpp-rinha-backend-2026",
+    "stack": ["C++23", "Clang 19", "libuv", "SIMD (AVX2)", "Custom LB"],
+    "open_to_work": true
+}

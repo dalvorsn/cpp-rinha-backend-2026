@@ -45,7 +45,7 @@ file(GLOB USOCKETS_SOURCES
 add_executable(api_server src/server.cpp ${USOCKETS_SOURCES})
 target_compile_definitions(api_server PRIVATE LIBUS_USE_EPOLL LIBUS_NO_SSL UWS_NO_ZLIB UWS_NO_SSL)
 target_include_directories(api_server PRIVATE ${UWS_INCLUDE_DIRS})
-target_link_libraries(api_server PRIVATE simdjson::simdjson pthread)
+target_link_libraries(api_server PRIVATE simdjson::simdjson pthread uv)
 
 add_executable(lb src/lb.cpp)
 target_include_directories(lb PRIVATE ${UWS_INCLUDE_DIRS})

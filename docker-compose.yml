@@ -1,7 +1,8 @@
 x-api-common: &api-common
-  image: dalvorsn/rinha-backend-2026:latest
-  command: ./api_server resources/references.bin resources/normalization.json resources/mcc_risk.json
-  
+  build:
+    context: .
+  volumes:
+    - socks:/run/sock
   deploy:
     resources:
       limits:
@@ -12,17 +13,23 @@ services:
   api1:
     <<: *api-common
     container_name: api1
+    command: ./api_server /run/sock/api1.sock resources/references.bin resources/normalization.json resources/mcc_risk.json
+  
 
   api2:
     <<: *api-common
     container_name: api2
+    command: ./api_server /run/sock/api2.sock resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   lb:
-    image: dalvorsn/rinha-backend-2026:latest
+    build:
+      context: .
     container_name: lb
+    volumes:
+      - socks:/run/sock
     command: /bin/sh -c "sleep 1 && ./lb"
     environment:
-      - LB_BACKENDS=api1:9999,api2:9999
+      - LB_BACKENDS=/run/sock/api1.sock,/run/sock/api2.sock
       - LB_PORT=9999
     ports:
       - "9999:9999"
@@ -38,3 +45,5 @@ services:
         limits:
           cpus: '0.06'
           memory: 50M
+volumes:
+  socks:

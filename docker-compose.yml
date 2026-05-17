@@ -1,49 +1,58 @@
-x-api-common: &api-common
+x-api: &api-common
   build:
     context: .
   volumes:
     - socks:/run/sock
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
   deploy:
     resources:
       limits:
-        cpus: '0.47'
-        memory: 150M
+        cpus: '0.45'
+        memory: 160M
 
 services:
   api1:
     <<: *api-common
     container_name: api1
-    command: ./api_server /run/sock/api1.sock resources/references.bin resources/normalization.json resources/mcc_risk.json
-  
+    command: ./api_server /run/sock/api1.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   api2:
     <<: *api-common
     container_name: api2
-    command: ./api_server /run/sock/api2.sock resources/references.bin resources/normalization.json resources/mcc_risk.json
+    command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   lb:
     build:
       context: .
     container_name: lb
-    volumes:
-      - socks:/run/sock
-    command: /bin/sh -c "sleep 1 && ./lb"
-    environment:
-      - LB_BACKENDS=/run/sock/api1.sock,/run/sock/api2.sock
-      - LB_PORT=9999
-    ports:
-      - "9999:9999"
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
     depends_on:
       - api1
       - api2
+    command: ./lb
+    environment:
+      - LB_PORT=9999
+      - LB_BACKENDS=/run/sock/api1.ctrl,/run/sock/api2.ctrl
+    ports:
+      - "9999:9999"
+    volumes:
+      - socks:/run/sock
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
-          cpus: '0.06'
-          memory: 50M
+          cpus: '0.1'
+          memory: 30M
+
 volumes:
   socks:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=10m"

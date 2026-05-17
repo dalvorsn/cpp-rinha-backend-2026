@@ -1,50 +1,58 @@
-x-api-common: &api-common
-  image: dalvorsn/rinha-backend-2026:latest
+x-api: &api-common
+  image: dalvorsn/rinha-backend-2026:preview
   pull_policy: always
   volumes:
-      - sock:/run/sock
+    - socks:/run/sock
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
   deploy:
     resources:
       limits:
-        cpus: "0.4"
-        memory: "160M"
+        cpus: '0.45'
+        memory: 160M
 
 services:
   api1:
     <<: *api-common
     container_name: api1
-    command: ./api_server /run/sock/api1.sock resources/references.bin resources/normalization.json resources/mcc_risk.json
+    command: ./api_server /run/sock/api1.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   api2:
     <<: *api-common
     container_name: api2
-    command: ./api_server /run/sock/api2.sock resources/references.bin resources/normalization.json resources/mcc_risk.json
+    command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   lb:
-    image: dalvorsn/rinha-backend-2026:latest
+    image: dalvorsn/rinha-backend-2026:preview
     pull_policy: always
-    restart: always
-    command: /bin/sh -c "sleep 1 && ./lb"
+    container_name: lb
     depends_on:
       - api1
       - api2
+    command: ./lb
     environment:
-      - LB_BACKENDS=/run/sock/api1.sock,/run/sock/api2.sock
       - LB_PORT=9999
+      - LB_BACKENDS=/run/sock/api1.ctrl,/run/sock/api2.ctrl
     ports:
       - "9999:9999"
     volumes:
-      - sock:/run/sock
-    deploy:
-      resources:
-        limits:
-          cpus: "0.2"
-          memory: "30M"
+      - socks:/run/sock
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 30M
 
 volumes:
-  sock:
-
+  socks:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=10m"

@@ -190,9 +190,17 @@ static void handle_client_read(int fd) {
         thread_local dom::parser parser;
         const char* body = c->buf + c->headers_size;
         int         blen = c->content_len;
-        padded_string padded(body, blen);
         dom::element doc;
-        bool ok = !parser.parse(padded).get(doc);
+        bool ok;
+        if (c->headers_size + blen + (int)SIMDJSON_PADDING <= BUF_CAP) {
+            // Parse in-place: zero the 64-byte padding region after the body,
+            // then parse without copying (saves one malloc/free per request).
+            memset(c->buf + c->headers_size + blen, 0, SIMDJSON_PADDING);
+            ok = !parser.parse(body, (size_t)blen, false).get(doc);
+        } else {
+            padded_string padded(body, (size_t)blen);
+            ok = !parser.parse(padded).get(doc);
+        }
         if (ok) {
             try {
                 float vec[14];

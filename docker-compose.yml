@@ -1,58 +1,34 @@
-x-api: &api-common
-  image: dalvorsn/rinha-backend-2026:preview
+x-api: &api
+  image: dalvorsn/rinha-backend-2026:luajit
   pull_policy: always
-  volumes:
-    - socks:/run/sock
+  volumes: [socks:/run/sock]
   ulimits:
-    nofile:
-      soft: 65535
-      hard: 65535
+    nofile: { soft: 65535, hard: 65535 }
   deploy:
     resources:
-      limits:
-        cpus: '0.45'
-        memory: 160M
+      limits: { cpus: '0.45', memory: 160M }
 
 services:
   api1:
-    <<: *api-common
+    <<: *api
     container_name: api1
-    command: ./api_server /run/sock/api1.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
+    environment: { SOCK_PATH: /run/sock/api1.sock }
 
   api2:
-    <<: *api-common
+    <<: *api
     container_name: api2
-    command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
+    environment: { SOCK_PATH: /run/sock/api2.sock }
 
   lb:
-    image: dalvorsn/rinha-backend-2026:preview
-    pull_policy: always
+    <<: *api
     container_name: lb
-    depends_on:
-      - api1
-      - api2
-    command: ./lb
-    environment:
-      - LB_PORT=9999
-      - LB_BACKENDS=/run/sock/api1.ctrl,/run/sock/api2.ctrl
-    ports:
-      - "9999:9999"
-    volumes:
-      - socks:/run/sock
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
+    depends_on: [api1, api2]
+    environment: { NGINX_CONF: /app/lua/nginx-lb.conf }
+    ports: ["9999:9999"]
     deploy:
       resources:
-        limits:
-          cpus: '0.1'
-          memory: 30M
+        limits: { cpus: '0.1', memory: 30M }
 
 volumes:
   socks:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: "size=10m"
+    driver_opts: { type: tmpfs, device: tmpfs, o: "size=1m" }

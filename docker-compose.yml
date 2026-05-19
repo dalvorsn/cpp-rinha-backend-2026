@@ -17,11 +17,13 @@ services:
   api1:
     <<: *api-common
     container_name: api1
+    cpuset: "0"
     command: ./api_server /run/sock/api1.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   api2:
     <<: *api-common
     container_name: api2
+    cpuset: "1"
     command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   lb:

@@ -14,7 +14,7 @@
 #include <cstring>
 #include <filesystem>
 
-#include "knn.hpp"
+#include "ball_tree.hpp"
 #include "normalizer.hpp"
 #include "simdjson.h"
 
@@ -74,7 +74,7 @@ struct Conn {
 };
 
 static Conn*      conns[MAX_FDS] = {};
-static KNN*       knn            = nullptr;
+static BallTree*  ball_tree      = nullptr;
 static Normalizer normalizer;
 static int        epfd           = -1;
 static int        ctrl_fd        = -1;
@@ -205,12 +205,12 @@ static void handle_client_read(int fd) {
             try {
                 float vec[14];
                 normalizer.normalize(doc, vec);
-                int cnt = knn->get_fraud_count(vec);
+                int cnt = ball_tree->get_fraud_count(vec);
                 DLOG("fd=%d fraud_count=%d\n", fd, cnt);
                 resp     = full_resp[cnt];
                 resp_len = full_resp_len[cnt];
             } catch (...) {
-                fprintf(stderr, "[ERR] fd=%d knn/normalize threw\n", fd);
+                fprintf(stderr, "[ERR] fd=%d ball_tree/normalize threw\n", fd);
                 ok = false;
             }
         }
@@ -331,9 +331,9 @@ int main(int argc, char* argv[]) {
             RESP_HDRS, strlen(BODIES[i]), BODIES[i]);
     }
 
-    fprintf(stderr, "[INFO] loading KNN: %s\n", argv[2]);
-    knn = new KNN(argv[2]);
-    fprintf(stderr, "[INFO] KNN loaded\n");
+    fprintf(stderr, "[INFO] loading ball tree: %s\n", argv[2]);
+    ball_tree = new BallTree(argv[2]);
+    fprintf(stderr, "[INFO] ball tree loaded\n");
 
     if (!normalizer.load_config(argv[4], argv[3])) {
         fprintf(stderr, "[ERR] failed to load normalizer config\n");

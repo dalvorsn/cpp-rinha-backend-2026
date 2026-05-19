@@ -34,7 +34,7 @@ target_include_directories(converter PRIVATE src)
 add_executable(lb src/lb.cpp)
 set_target_properties(lb PROPERTIES LINKER_LANGUAGE C)
 
-# ── api_server: epoll HTTP server with ball-tree KNN ─────────────────────────
+# ── api_server: epoll HTTP server with ball-tree search ──────────────────────
 add_executable(api_server src/server.cpp)
 target_link_libraries(api_server PRIVATE simdjson::simdjson pthread)
 target_include_directories(api_server PRIVATE src)

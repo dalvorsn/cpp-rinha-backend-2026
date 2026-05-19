@@ -11,7 +11,7 @@
 
 #include "types.hpp"
 
-class KNN {
+class BallTree {
  public:
     void*    mmap_ptr  = nullptr;
     size_t   mmap_size = 0;
@@ -22,15 +22,15 @@ class KNN {
     float                global_scale_sq = 0;
     float                inv_range_scale = 0; // 65535 / range, precomputed
 
-    explicit KNN(const char* filename) {
+    explicit BallTree(const char* filename) {
         int fd = open(filename, O_RDONLY);
-        if (fd < 0) { perror("knn open"); std::exit(1); }
+        if (fd < 0) { perror("ball_tree open"); std::exit(1); }
         struct stat st;
         fstat(fd, &st);
         mmap_size = (size_t)st.st_size;
         mmap_ptr  = mmap(nullptr, mmap_size, PROT_READ,
                          MAP_PRIVATE | MAP_POPULATE, fd, 0);
-        if (mmap_ptr == MAP_FAILED) { perror("knn mmap"); std::exit(1); }
+        if (mmap_ptr == MAP_FAILED) { perror("ball_tree mmap"); std::exit(1); }
         close(fd);
         mlock(mmap_ptr, mmap_size);
 
@@ -48,7 +48,7 @@ class KNN {
         madvise((void*)blocks, hdr->num_blocks * sizeof(Block8), MADV_RANDOM);
     }
 
-    ~KNN() {
+    ~BallTree() {
         if (mmap_ptr && mmap_ptr != MAP_FAILED) munmap(mmap_ptr, mmap_size);
     }
 

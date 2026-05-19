@@ -127,7 +127,7 @@ class Normalizer {
     bool card_present = terminal["card_present"].get_bool();
     float km_from_home = (float)terminal["km_from_home"].get_double();
 
-    // 0. amount — no round4, KNN doesn't need it
+    // 0. amount — no round4, ball tree doesn't need it
     vec[0] = clampf(amount * inv_max_amount);
 
     // 1. installments

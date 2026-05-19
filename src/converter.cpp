@@ -11,7 +11,7 @@
 
 using namespace simdjson;
 
-static constexpr int LEAF_SIZE = 512; // vectors per leaf (= 16 Block8 blocks)
+static constexpr int LEAF_SIZE = 256; // vectors per leaf (= 16 Block8 blocks)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Build state

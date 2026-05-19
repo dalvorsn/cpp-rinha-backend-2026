@@ -1,9 +1,11 @@
 #include <algorithm>
-#include <cassert>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <random>
 #include <vector>
 
 #include "simdjson.h"
@@ -11,182 +13,298 @@
 
 using namespace simdjson;
 
-static constexpr int LEAF_SIZE = 256; // vectors per leaf (= 16 Block8 blocks)
+static constexpr uint32_t DEFAULT_K      = 4096;
+static constexpr uint32_t DEFAULT_SAMPLE = 50000;
+static constexpr int      DEFAULT_ITERS  = 50;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Build state
-// ─────────────────────────────────────────────────────────────────────────────
-static QuantParams              qp;
-static std::vector<BallNode>    nodes;
-static std::vector<Block8>      blocks;
-
-static Block8 make_block(const VectorRecord* recs, int count) {
-    Block8 b;
-    memset(&b, 0, sizeof(b));
-    for (int j = 0; j < 8; j++) {
-        int idx = (j < count) ? j : (count - 1);
-        for (int d = 0; d < 14; d++) {
-            double q = (double)(recs[idx].dimensions[d] - qp.min_global)
-                       / (double)qp.range_global * 65535.0;
-            b.dims[d][j] = (uint16_t)std::clamp(std::round(q), 0.0, 65535.0);
-        }
-        b.is_fraud[j] = (recs[idx].dimensions[15] > 0.5f) ? 1u : 0u;
-    }
-    b.n_valid = (uint8_t)count;
-    return b;
+static inline int16_t quantize(double v) {
+    if (v < -1.0) v = -1.0;
+    if (v >  1.0) v =  1.0;
+    return static_cast<int16_t>(std::llround(v * 10000.0));
 }
 
-// Recursive ball-tree construction.
-// Returns the index of the newly created node in `nodes`.
-static int build(std::vector<VectorRecord>& data, int lo, int hi) {
-    int node_idx = (int)nodes.size();
-    nodes.push_back({});
+// ── Distance helpers ──────────────────────────────────────────────────────────
 
-    int count = hi - lo;
-
-    // ── Compute ball center (mean of all points) ──────────────────────────
-    float center[14] = {};
-    for (int i = lo; i < hi; i++)
-        for (int d = 0; d < 14; d++)
-            center[d] += data[i].dimensions[d];
-    for (int d = 0; d < 14; d++) {
-        center[d] /= (float)count;
-        nodes[node_idx].center[d] = center[d];
+static float dist_to_centroid(const int16_t* p,
+                               const std::array<float, IVF_DIMS>& c) {
+    float s = 0;
+    for (int d = 0; d < IVF_DIMS; ++d) {
+        float diff = float(p[d]) - c[d];
+        s += diff * diff;
     }
-
-    // ── Compute bounding radius ───────────────────────────────────────────
-    float max_r2 = 0.0f;
-    for (int i = lo; i < hi; i++) {
-        float r2 = 0;
-        for (int d = 0; d < 14; d++) {
-            float diff = data[i].dimensions[d] - center[d];
-            r2 += diff * diff;
-        }
-        if (r2 > max_r2) max_r2 = r2;
-    }
-    nodes[node_idx].radius = std::sqrt(max_r2);
-
-    // ── Leaf ──────────────────────────────────────────────────────────────
-    if (count <= LEAF_SIZE) {
-        nodes[node_idx].is_leaf    = 1;
-        nodes[node_idx].left       = -1;
-        nodes[node_idx].right      = -1;
-        nodes[node_idx].leaf_start = (int32_t)blocks.size();
-        nodes[node_idx].leaf_count = 0;
-
-        for (int bi = 0; bi < count; bi += 8) {
-            int n8 = std::min(8, count - bi);
-            blocks.push_back(make_block(&data[lo + bi], n8));
-            nodes[node_idx].leaf_count++;
-        }
-        return node_idx;
-    }
-
-    // ── Internal: split along the dimension with greatest spread ─────────
-    int   best_dim    = 0;
-    float best_spread = -1.0f;
-    for (int d = 0; d < 14; d++) {
-        float mn = 1e18f, mx = -1e18f;
-        for (int i = lo; i < hi; i++) {
-            float v = data[i].dimensions[d];
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-        }
-        float s = mx - mn;
-        if (s > best_spread) { best_spread = s; best_dim = d; }
-    }
-
-    int mid = lo + count / 2;
-    std::nth_element(data.begin() + lo, data.begin() + mid, data.begin() + hi,
-        [best_dim](const VectorRecord& a, const VectorRecord& b) {
-            return a.dimensions[best_dim] < b.dimensions[best_dim];
-        });
-
-    nodes[node_idx].is_leaf    = 0;
-    nodes[node_idx].leaf_start = 0;
-    nodes[node_idx].leaf_count = 0;
-
-    // Recurse — access nodes[node_idx] by index after each push_back
-    int left  = build(data, lo,  mid);
-    int right = build(data, mid, hi);
-
-    nodes[node_idx].left  = left;
-    nodes[node_idx].right = right;
-
-    return node_idx;
+    return s;
 }
+
+static uint32_t nearest_centroid(
+    const int16_t* p,
+    const std::vector<std::array<float, IVF_DIMS>>& centroids)
+{
+    uint32_t best   = 0;
+    float    best_d = dist_to_centroid(p, centroids[0]);
+    for (uint32_t c = 1; c < (uint32_t)centroids.size(); ++c) {
+        float d = dist_to_centroid(p, centroids[c]);
+        if (d < best_d) { best_d = d; best = c; }
+    }
+    return best;
+}
+
+// ── K-means++ init ────────────────────────────────────────────────────────────
+
+static std::vector<std::array<float, IVF_DIMS>> init_kmeans_pp(
+    const std::vector<int16_t>& vecs,
+    const std::vector<uint32_t>& sample,
+    uint32_t k, uint64_t seed)
+{
+    std::vector<std::array<float, IVF_DIMS>> centroids(k);
+    std::vector<float> dmin(sample.size(), std::numeric_limits<float>::infinity());
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<size_t> rand_idx(0, sample.size() - 1);
+
+    const int16_t* fp = vecs.data() + size_t(sample[rand_idx(rng)]) * IVF_DIMS;
+    for (int d = 0; d < IVF_DIMS; ++d) centroids[0][d] = float(fp[d]);
+
+    for (uint32_t c = 1; c < k; ++c) {
+        const auto& prev = centroids[c - 1];
+        double sum = 0;
+        for (size_t i = 0; i < sample.size(); ++i) {
+            float dist = dist_to_centroid(vecs.data() + size_t(sample[i]) * IVF_DIMS, prev);
+            if (dist < dmin[i]) dmin[i] = dist;
+            sum += dmin[i];
+        }
+        if (sum <= 0) {
+            const int16_t* pp = vecs.data() + size_t(sample[rand_idx(rng)]) * IVF_DIMS;
+            for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(pp[d]);
+            continue;
+        }
+        std::uniform_real_distribution<double> wheel(0, sum);
+        double target = wheel(rng), acc = 0;
+        size_t chosen = sample.size() - 1;
+        for (size_t i = 0; i < sample.size(); ++i) {
+            acc += dmin[i];
+            if (acc >= target) { chosen = i; break; }
+        }
+        const int16_t* pp = vecs.data() + size_t(sample[chosen]) * IVF_DIMS;
+        for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(pp[d]);
+        if ((c & 255u) == 0)
+            std::cerr << "  init " << c << "/" << k << "\n";
+    }
+    return centroids;
+}
+
+// ── K-means training ──────────────────────────────────────────────────────────
+
+static void train_kmeans(
+    const std::vector<int16_t>& vecs,
+    const std::vector<uint32_t>& sample,
+    std::vector<std::array<float, IVF_DIMS>>& centroids,
+    int iters)
+{
+    const uint32_t k = (uint32_t)centroids.size();
+    std::vector<uint32_t> assign(sample.size(), 0);
+    std::mt19937_64 rng(0xC0FFEE);
+
+    for (int iter = 0; iter < iters; ++iter) {
+        uint64_t changed = 0;
+        for (size_t i = 0; i < sample.size(); ++i) {
+            uint32_t c = nearest_centroid(
+                vecs.data() + size_t(sample[i]) * IVF_DIMS, centroids);
+            if (c != assign[i]) { ++changed; assign[i] = c; }
+        }
+
+        std::vector<double> sums(size_t(k) * IVF_DIMS, 0.0);
+        std::vector<uint32_t> counts(k, 0);
+        for (size_t i = 0; i < sample.size(); ++i) {
+            uint32_t c = assign[i];
+            const int16_t* p = vecs.data() + size_t(sample[i]) * IVF_DIMS;
+            ++counts[c];
+            double* row = sums.data() + size_t(c) * IVF_DIMS;
+            for (int d = 0; d < IVF_DIMS; ++d) row[d] += p[d];
+        }
+
+        std::uniform_int_distribution<size_t> pick(0, sample.size() - 1);
+        for (uint32_t c = 0; c < k; ++c) {
+            if (counts[c] == 0) {
+                const int16_t* p = vecs.data() + size_t(sample[pick(rng)]) * IVF_DIMS;
+                for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(p[d]);
+            } else {
+                double inv = 1.0 / counts[c];
+                double* row = sums.data() + size_t(c) * IVF_DIMS;
+                for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(row[d] * inv);
+            }
+        }
+        std::cerr << "  iter " << (iter + 1) << "/" << iters
+                  << " changed=" << changed << "\n";
+        if (changed == 0) break;
+    }
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <input.json> <output.bin>\n";
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <input.json> <output.bin>"
+                  << " [k=" << DEFAULT_K << "]"
+                  << " [sample=" << DEFAULT_SAMPLE << "]"
+                  << " [iters=" << DEFAULT_ITERS << "]\n";
         return 1;
     }
+    const char* input  = argv[1];
+    const char* output = argv[2];
+    uint32_t k         = argc > 3 ? (uint32_t)std::stoul(argv[3]) : DEFAULT_K;
+    uint32_t sample_sz = argc > 4 ? (uint32_t)std::stoul(argv[4]) : DEFAULT_SAMPLE;
+    int      iters     = argc > 5 ? std::stoi(argv[5])            : DEFAULT_ITERS;
 
-    // ── Load references JSON ──────────────────────────────────────────────
+    // ── Parse references ──────────────────────────────────────────────────────
+    std::cerr << "Parsing " << input << "...\n";
     ondemand::parser parser;
-    padded_string    json;
-    if (padded_string::load(argv[1]).get(json)) return 1;
-
+    padded_string json;
+    if (padded_string::load(input).get(json)) {
+        std::cerr << "load failed\n"; return 1;
+    }
     ondemand::document doc;
-    if (parser.iterate(json).get(doc)) return 1;
-
-    std::vector<VectorRecord> records;
-    records.reserve(3'000'000);
-
-    float g_min =  1e18f, g_max = -1e18f;
-
-    for (ondemand::object obj : doc.get_array()) {
-        VectorRecord rec;
-        memset(&rec, 0, sizeof(rec));
-        int i = 0;
-        for (double v : obj["vector"].get_array()) {
-            if (i < 14) {
-                rec.dimensions[i] = (float)v;
-                if ((float)v < g_min) g_min = (float)v;
-                if ((float)v > g_max) g_max = (float)v;
-            }
-            i++;
-        }
-        std::string_view label;
-        if (obj["label"].get_string().get(label)) continue;
-        rec.dimensions[15] = (label == "fraud") ? 1.0f : 0.0f;
-        records.push_back(rec);
+    if (parser.iterate(json).get(doc)) {
+        std::cerr << "parse failed\n"; return 1;
     }
 
-    std::cerr << "Loaded " << records.size() << " records\n";
+    std::vector<int16_t> vecs;
+    std::vector<uint8_t> labels;
+    vecs.reserve(size_t(3'000'000) * IVF_DIMS);
+    labels.reserve(3'000'000);
 
-    // ── Quantisation parameters ───────────────────────────────────────────
-    qp.min_global   = g_min;
-    qp.range_global = (g_max - g_min < 1e-9f) ? 1.0f : (g_max - g_min);
-    float global_scale_sq = (qp.range_global / 65535.0f) * (qp.range_global / 65535.0f);
+    for (ondemand::object obj : doc.get_array()) {
+        int i = 0;
+        for (double v : obj["vector"].get_array()) {
+            if (i < IVF_DIMS) vecs.push_back(quantize(v));
+            ++i;
+        }
+        std::string_view label;
+        if (obj["label"].get_string().get(label)) {
+            vecs.resize(vecs.size() - IVF_DIMS);
+            continue;
+        }
+        labels.push_back(label == "fraud" ? 1u : 0u);
+    }
+    const uint32_t n = (uint32_t)labels.size();
+    std::cerr << "Loaded " << n << " records\n";
 
-    // ── Build ball tree ───────────────────────────────────────────────────
-    int estimated_leaves   = ((int)records.size() + LEAF_SIZE - 1) / LEAF_SIZE;
-    int estimated_nodes    = estimated_leaves * 2 + 16;
-    int estimated_blocks   = ((int)records.size() + 7) / 8;
-    nodes.reserve(estimated_nodes);
-    blocks.reserve(estimated_blocks);
+    // ── Sample for k-means ────────────────────────────────────────────────────
+    std::mt19937_64 rng(42);
+    uint32_t actual_sample = std::min(sample_sz, n);
+    std::vector<uint32_t> sample(actual_sample);
+    std::uniform_int_distribution<uint32_t> pick_rec(0, n - 1);
+    for (auto& s : sample) s = pick_rec(rng);
 
-    std::cerr << "Building ball tree (LEAF_SIZE=" << LEAF_SIZE << ")...\n";
-    build(records, 0, (int)records.size());
-    std::cerr << "  nodes=" << nodes.size() << "  blocks=" << blocks.size() << "\n";
+    // ── K-means ───────────────────────────────────────────────────────────────
+    std::cerr << "K-means++ init (k=" << k
+              << ", sample=" << actual_sample << ")...\n";
+    auto centroids = init_kmeans_pp(vecs, sample, k, 42);
+    std::cerr << "Training...\n";
+    train_kmeans(vecs, sample, centroids, iters);
 
-    // ── Write binary ──────────────────────────────────────────────────────
-    BallTreeHeader hdr   = {};
-    hdr.magic            = 0xBA11BEEF;
-    hdr.num_nodes        = (uint32_t)nodes.size();
-    hdr.num_blocks       = (uint32_t)blocks.size();
-    hdr.qp_min_global    = qp.min_global;
-    hdr.qp_range_global  = qp.range_global;
-    hdr.global_scale_sq  = global_scale_sq;
+    // ── Assign all vectors ────────────────────────────────────────────────────
+    std::cerr << "Assigning " << n << " vectors...\n";
+    std::vector<uint32_t> assignment(n);
+    std::vector<uint32_t> counts(k, 0);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t c = nearest_centroid(vecs.data() + size_t(i) * IVF_DIMS, centroids);
+        assignment[i] = c;
+        ++counts[c];
+        if (i % 500000 == 0 && i > 0)
+            std::cerr << "  assigned " << i << "/" << n << "\n";
+    }
 
-    std::ofstream out(argv[2], std::ios::binary);
-    if (!out) { std::cerr << "Cannot write " << argv[2] << "\n"; return 1; }
+    // ── Block offsets ─────────────────────────────────────────────────────────
+    std::vector<uint32_t> block_offsets(k + 1, 0);
+    for (uint32_t c = 0; c < k; ++c)
+        block_offsets[c + 1] = block_offsets[c]
+                              + (counts[c] + IVF_BLOCK - 1) / IVF_BLOCK;
+    const uint32_t total_blocks = block_offsets[k];
 
-    out.write((const char*)&hdr,          sizeof(hdr));
-    out.write((const char*)nodes.data(),  nodes.size()  * sizeof(BallNode));
-    out.write((const char*)blocks.data(), blocks.size() * sizeof(Block8));
+    // ── Sort into cluster order ───────────────────────────────────────────────
+    std::vector<uint32_t> starts(k + 1, 0);
+    for (uint32_t c = 0; c < k; ++c) starts[c + 1] = starts[c] + counts[c];
+    std::vector<uint32_t> cursor = starts;
+    std::vector<uint32_t> order(n);
+    for (uint32_t i = 0; i < n; ++i) order[cursor[assignment[i]]++] = i;
 
-    std::cerr << "Written " << argv[2] << "\n";
+    // ── Quantize centroids ────────────────────────────────────────────────────
+    std::vector<int16_t> qcentroids(size_t(k) * IVF_DIMS);
+    for (uint32_t c = 0; c < k; ++c)
+        for (int d = 0; d < IVF_DIMS; ++d)
+            qcentroids[size_t(c) * IVF_DIMS + d] =
+                static_cast<int16_t>(std::llround(centroids[c][d]));
+
+    // ── Pack blocks + bounding boxes ─────────────────────────────────────────
+    std::vector<int16_t> bbox_min(size_t(k) * IVF_DIMS,
+                                   std::numeric_limits<int16_t>::max());
+    std::vector<int16_t> bbox_max(size_t(k) * IVF_DIMS,
+                                   std::numeric_limits<int16_t>::min());
+    std::vector<uint8_t> out_labels(size_t(total_blocks) * IVF_BLOCK, 0);
+    std::vector<int16_t> blocks_data(size_t(total_blocks) * IVF_DIMS * IVF_BLOCK, 0);
+
+    for (uint32_t c = 0; c < k; ++c) {
+        if (counts[c] == 0) {
+            for (int d = 0; d < IVF_DIMS; ++d) {
+                bbox_min[size_t(c) * IVF_DIMS + d] = 0;
+                bbox_max[size_t(c) * IVF_DIMS + d] = 0;
+            }
+            continue;
+        }
+        for (uint32_t pos = 0; pos < counts[c]; ++pos) {
+            const uint32_t orig  = order[starts[c] + pos];
+            const uint32_t block = block_offsets[c] + pos / IVF_BLOCK;
+            const uint32_t lane  = pos % IVF_BLOCK;
+
+            out_labels[size_t(block) * IVF_BLOCK + lane] = labels[orig];
+
+            const int16_t* src = vecs.data() + size_t(orig) * IVF_DIMS;
+            int16_t* dst = blocks_data.data() + size_t(block) * IVF_DIMS * IVF_BLOCK;
+            for (int d = 0; d < IVF_DIMS; ++d) {
+                int16_t v = src[d];
+                dst[block_pair_offset(d, (int)lane)] = v;
+                int16_t& mn = bbox_min[size_t(c) * IVF_DIMS + d];
+                int16_t& mx = bbox_max[size_t(c) * IVF_DIMS + d];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+        }
+    }
+
+    // ── Write index ───────────────────────────────────────────────────────────
+    IndexHeader hdr{};
+    hdr.magic        = IVF_MAGIC;
+    hdr.version      = IVF_VERSION;
+    hdr.n            = n;
+    hdr.k            = k;
+    hdr.total_blocks = total_blocks;
+    hdr.block_size   = IVF_BLOCK;
+    hdr.dims         = IVF_DIMS;
+
+    const IndexLayout layout = layout_for(k, total_blocks);
+
+    std::ofstream out(output, std::ios::binary | std::ios::trunc);
+    if (!out) { std::cerr << "Cannot write " << output << "\n"; return 1; }
+    out.seekp((std::streamoff)(layout.total - 1));
+    out.put('\0');
+
+    auto write_at = [&](size_t off, const void* data, size_t len) {
+        out.seekp((std::streamoff)off);
+        out.write(static_cast<const char*>(data), (std::streamsize)len);
+    };
+
+    write_at(0,                &hdr,              sizeof(hdr));
+    write_at(layout.centroids, qcentroids.data(), qcentroids.size() * sizeof(int16_t));
+    write_at(layout.bbox_min,  bbox_min.data(),   bbox_min.size()   * sizeof(int16_t));
+    write_at(layout.bbox_max,  bbox_max.data(),   bbox_max.size()   * sizeof(int16_t));
+    write_at(layout.offsets,   block_offsets.data(),
+             block_offsets.size() * sizeof(uint32_t));
+    write_at(layout.counts,    counts.data(),     counts.size()     * sizeof(uint32_t));
+    write_at(layout.labels,    out_labels.data(), out_labels.size());
+    write_at(layout.blocks,    blocks_data.data(),
+             blocks_data.size() * sizeof(int16_t));
+
+    std::cerr << "Written " << output
+              << " (" << (layout.total / (1024 * 1024)) << " MB)\n";
     return 0;
 }

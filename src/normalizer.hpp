@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -102,6 +104,18 @@ class Normalizer {
     int dow = (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
     // Convert from 0=Sunday to 0=Monday
     return (dow + 6) % 7;
+  }
+
+  void normalize(dom::element& req, int16_t* out) {
+    float vec[14];
+    normalize(req, vec);
+    for (int i = 0; i < 14; i++) {
+      // Use double + llround to match converter.cpp's quantize() exactly.
+      double v = (double)vec[i] * 10000.0;
+      if (v < -10000.0) v = -10000.0;
+      if (v >  10000.0) v =  10000.0;
+      out[i] = (int16_t)std::llround(v);
+    }
   }
 
   void normalize(dom::element& req, float* vec) {

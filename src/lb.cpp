@@ -1,134 +1,164 @@
-#include <iostream>
-#include <vector>
-#include <string>
-#include <sstream>
-#include <sys/epoll.h>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <netinet/in.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <cstring>
-#include <map>
 
-#define MAX_EVENTS 1024
-#define BUFFER_SIZE 16384
+#ifdef DEBUG
+#define DLOG(...) fprintf(stderr, "[DBG/LB] " __VA_ARGS__)
+#else
+#define DLOG(...) ((void)0)
+#endif
 
-static char shared_buffer[BUFFER_SIZE];
+static int ctrl_fds[2] = {-1, -1};
+static char ctrl_paths[2][256];
+static int num_backends = 0;
 
-void set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+static int connect_ctrl(int i) {
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+
+  struct sockaddr_un addr = {};
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, ctrl_paths[i], sizeof(addr.sun_path) - 1);
+
+  // Retry until the backend creates its control socket
+  int attempts = 0;
+  while (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (errno != ENOENT && errno != ECONNREFUSED) {
+      fprintf(stderr, "[ERR/LB] connect backend %s: %s\n", addr.sun_path,
+              strerror(errno));
+      close(fd);
+      return -1;
+    }
+    if (attempts++ % 50 == 0)
+      fprintf(stderr, "[INFO/LB] waiting for backend %s (attempt %d)...\n",
+              addr.sun_path, attempts);
+    usleep(20000);
+  }
+  DLOG("connect_ctrl: connected to %s after %d attempts\n", addr.sun_path,
+       attempts);
+  return fd;
 }
 
-class BackendPool {
-    std::map<std::string, int> pool;
+static int send_fd(int ctrl, int client_fd) {
+  char buf[1] = {0};
+  struct iovec iov = {buf, 1};
+  char cmsg_buf[CMSG_SPACE(sizeof(int))];
 
-public:
-    int get_connection(const std::string& path) {
-        if (pool.count(path)) {
-            int fd = pool[path];
-            int error = 0;
-            socklen_t len = sizeof(error);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
-                return fd;
-            }
-            close(fd);
-            pool.erase(path);
-        }
+  struct msghdr msg = {};
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cmsg_buf;
+  msg.msg_controllen = sizeof(cmsg_buf);
 
-        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd < 0) return -1;
+  struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(cmsg), &client_fd, sizeof(int));
 
-        struct sockaddr_un addr = {};
-        addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  ssize_t r = sendmsg(ctrl, &msg, MSG_NOSIGNAL);
+  if (r <= 0) {
+    fprintf(stderr, "[ERR/LB] send_fd: sendmsg ctrl=%d client_fd=%d: %s\n",
+            ctrl, client_fd, strerror(errno));
+    return -1;
+  }
+  DLOG("send_fd: ctrl=%d client_fd=%d OK\n", ctrl, client_fd);
+  return 0;
+}
 
-        if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            close(fd);
-            return -1;
-        }
+int main(void) {
+  const char *port_env = getenv("LB_PORT");
+  int port = port_env ? atoi(port_env) : 9999;
 
-        pool[path] = fd;
-        return fd;
+  const char *be_env = getenv("LB_BACKENDS");
+  if (!be_env) {
+    fprintf(stderr, "LB_BACKENDS not set\n");
+    return 1;
+  }
+
+  char tmp[1024];
+  strncpy(tmp, be_env, sizeof(tmp) - 1);
+  char *tok = strtok(tmp, ",");
+  while (tok && num_backends < 2) {
+    strncpy(ctrl_paths[num_backends++], tok, 255);
+    tok = strtok(NULL, ",");
+  }
+  if (num_backends == 0) return 1;
+
+  // Connect to all backend control sockets (retrying until available)
+  for (int i = 0; i < num_backends; i++) {
+    ctrl_fds[i] = connect_ctrl(i);
+    if (ctrl_fds[i] < 0) {
+      fprintf(stderr, "Cannot connect to backend %d: %s\n", i, ctrl_paths[i]);
+      return 1;
+    }
+    fprintf(stderr, "LB: connected to backend %d (%s)\n", i, ctrl_paths[i]);
+  }
+
+  int srv = socket(AF_INET, SOCK_STREAM, 0);
+  int opt = 1;
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_port = htons(port);
+
+  if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    perror("bind");
+    return 1;
+  }
+  listen(srv, SOMAXCONN);
+  fprintf(stderr, "LB: listening on port %d\n", port);
+
+  int cur = 0;
+  long total = 0;
+  while (1) {
+    struct sockaddr_in cli_addr;
+    socklen_t cli_len = sizeof(cli_addr);
+    int client_fd = accept(srv, (struct sockaddr *)&cli_addr, &cli_len);
+    if (client_fd < 0) {
+      fprintf(stderr, "[ERR/LB] accept: %s\n", strerror(errno));
+      continue;
     }
 
-    void invalidate(const std::string& path) {
-        if (pool.count(path)) {
-            close(pool[path]);
-            pool.erase(path);
-        }
+    total++;
+    int nodelay = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    int idx = cur;
+    cur = (cur + 1) % num_backends;
+
+    DLOG("accept fd=%d total=%ld → backend[%d] ctrl=%d\n", client_fd, total,
+         idx, ctrl_fds[idx]);
+
+    if (send_fd(ctrl_fds[idx], client_fd) < 0) {
+      fprintf(stderr,
+              "[WARN/LB] send_fd failed for backend[%d], reconnecting...\n",
+              idx);
+      close(ctrl_fds[idx]);
+      ctrl_fds[idx] = connect_ctrl(idx);
+      if (ctrl_fds[idx] >= 0) {
+        if (send_fd(ctrl_fds[idx], client_fd) < 0)
+          fprintf(stderr,
+                  "[ERR/LB] retry send_fd also failed for backend[%d]\n", idx);
+      } else {
+        fprintf(stderr, "[ERR/LB] reconnect backend[%d] failed\n", idx);
+      }
     }
-};
 
-int main() {
-    const char* env_port = std::getenv("LB_PORT");
-    int port = env_port ? std::stoi(env_port) : 9999;
-
-    const char* env_backends = std::getenv("LB_BACKENDS");
-    std::vector<std::string> backends;
-    if (env_backends) {
-        std::stringstream ss(env_backends);
-        std::string path;
-        while (std::getline(ss, path, ',')) {
-            backends.push_back(path);
-        }
-    }
-
-    if (backends.empty()) return 1;
-
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return 1;
-    listen(server_fd, SOMAXCONN);
-    set_nonblocking(server_fd);
-
-    int epoll_fd = epoll_create1(0);
-    struct epoll_event ev, events[MAX_EVENTS];
-    ev.events = EPOLLIN;
-    ev.data.fd = server_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
-
-    BackendPool pool;
-    int current_idx = 0;
-
-    while (true) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        
-        for (int i = 0; i < nfds; ++i) {
-            if (events[i].data.fd == server_fd) {
-                int client_fd = accept(server_fd, NULL, NULL);
-                if (client_fd < 0) continue;
-
-                std::string target_path = backends[current_idx];
-                current_idx = (current_idx + 1) % backends.size();
-
-                int backend_fd = pool.get_connection(target_path);
-                
-                if (backend_fd > 0) {
-                    ssize_t n = recv(client_fd, shared_buffer, BUFFER_SIZE, 0);
-                    if (n > 0) {
-                        if (send(backend_fd, shared_buffer, n, 0) < 0) {
-                            pool.invalidate(target_path);
-                        }
-                    }
-
-                    n = recv(backend_fd, shared_buffer, BUFFER_SIZE, 0);
-                    if (n > 0) {
-                        send(client_fd, shared_buffer, n, 0);
-                    }
-                }
-
-                close(client_fd);
-            }
-        }
-    }
-    return 0;
+    close(client_fd);  // LB releases its copy; backend owns the socket now
+    DLOG("closed lb copy of fd=%d\n", client_fd);
+  }
+  return 0;
 }

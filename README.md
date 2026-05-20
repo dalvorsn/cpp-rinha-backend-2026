@@ -1,40 +1,157 @@
 [![Build and Push Rinha Image](https://github.com/dalvorsn/cpp-rinha-backend-2026/actions/workflows/publish.yaml/badge.svg?branch=main)](https://github.com/dalvorsn/cpp-rinha-backend-2026/actions/workflows/publish.yaml)
 # Rinha de Backend — 2026
 
-A lightweight, high-performance backend used in the annual "Rinha de Backend" event (an annual backend coding competition). This repository contains a compact C++ service that computes fraud scores using a KNN-like approach over pre-quantized vectors, plus a tiny custom load-balancer.
+C++ service for the [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026) event. The task: given a transaction request, compute a fraud score by finding the 5 nearest neighbors across a reference dataset and returning the ratio of fraudulent ones.
 
-**What this is**
-- A small, optimized C++ backend focused on throughput and low latency.
-- Includes a `converter` tool to build a compact binary dataset from JSON references, an `api_server` that serves a `/fraud-score` endpoint, and a minimal `lb` load balancer.
-- Intended for the Rinha de Backend event — fast, pragmatic, and a bit playful.
+## Architecture
 
-**Repository layout**
-- `src/` — source files: `converter.cpp`, `server.cpp`, `lb.cpp`, `knn.hpp`, `normalizer.hpp`, `types.hpp`.
-- `resources/` — JSON inputs and example payloads. Place `references.json` (or `references.json.gz`) here.
-- `Dockerfile`, `docker-compose.yml` — containerized build and run setup.
-- `CMakeLists.txt` — build configuration.
+Two `api_server` instances sit behind a custom `lb` process. The load balancer accepts TCP connections and forwards them to backends via SCM_RIGHTS (passing the raw socket fd over a Unix domain socket), so each backend owns its connection directly — no proxy overhead.
 
-**Build**
+Each `api_server` runs a single-threaded epoll loop. There are no worker threads, no locks, no queues. The IVF index and normalizer live in process memory; after startup the working set is locked with `mlockall` to avoid page faults under load.
+
+```mermaid
+flowchart LR
+    C([Client]) -->|TCP :9999| LB
+
+    subgraph LB["lb — round-robin"]
+        A["accept()"] --> S["send_fd() · SCM_RIGHTS"]
+    end
+
+    LB -->|Unix socket| S0
+    LB -->|Unix socket| S1
+
+    subgraph S0["api_server [0]"]
+        E0["epoll loop · IVF index · Normalizer"]
+    end
+
+    subgraph S1["api_server [1]"]
+        E1["epoll loop · IVF index · Normalizer"]
+    end
+```
+
+## Algorithm: IVF with SIMD scan
+
+The reference vectors are quantized to `int16` (scale ×10000, range `[-10000, 10000]`), grouped into blocks of 8, and stored in a pair-SoA layout (dimensions interleaved in pairs) so that 7 AVX2 `madd_epi16` instructions cover all 14 dimensions at once.
+
+At query time:
+
+```mermaid
+flowchart TD
+    Q(["`query vec — 14 × int16`"]) --> CS
+
+    CS["`**1. Centroid search**
+AVX2 pair-SoA scan over k=4096 centroids
+→ NPROBE=4 nearest cluster IDs`"] --> SC
+
+    SC["`**2. Cluster scan**
+scan blocks of 8 vectors with 7× madd_epi16
+partial prune after 10/14 dims`"] --> CHK
+
+    CHK{"`cnt ∈ 1..4?`"}
+    CHK -->|no — clear result| SCORE(["`fraud_score = cnt / 5`"])
+    CHK -->|yes — ambiguous| REP
+
+    REP["`**3. Repair pass**
+scan remaining k−4 clusters
+ordered by bbox lower bound
+prune if lb ≥ max_top`"] --> SCORE2(["`fraud_score = cnt / 5`"])
+```
+
+1. **Centroid search** — find the `NPROBE` nearest cluster centroids using AVX2 distance accumulation over a prebuilt pair-SoA centroid table.
+2. **Cluster scan** — scan each selected cluster block-by-block with partial pruning: after 10 of 14 dimensions, skip a block if all 8 lanes already exceed the current worst-of-top-5.
+3. **Repair pass** — if the top-5 result is mixed (1–4 fraud out of 5), the initial probes may have missed the true neighborhood. A second pass scans all remaining clusters ordered by their bbox lower bound, pruning aggressively using the tightened max distance.
+
+### Block memory layout (pair-SoA)
+
+Vectors are stored in groups of 8 with dimensions interleaved in pairs. One AVX2 register covers one pair across all 8 lanes — so 7 loads + 7 `madd_epi16` compute the full L2 distance for 8 vectors simultaneously.
+
+```mermaid
+flowchart LR
+    subgraph B["Block — 8 vectors × 14 dims = 7 pairs × 8 lanes"]
+        direction TB
+        P0["`**pair 0** — d0·d1
+v0 v1 v2 v3 v4 v5 v6 v7`"]
+        P1["`**pair 1** — d2·d3
+v0 v1 v2 v3 v4 v5 v6 v7`"]
+        P2["`**pair 2** — d4·d5`"]
+        P3["`**pair 3** — d6·d7`"]
+        P4["`**pair 4** — d8·d9  ← prune checkpoint`"]
+        P5["`**pair 5** — d10·d11`"]
+        P6["`**pair 6** — d12·d13`"]
+    end
+
+    R["1× __m256i load per pair\n7 loads + 7 madd_epi16\n= full L2 for 8 vectors"]
+    B --- R
+```
+
+Each pair row = one `__m256i` load (16 × int16). 7 rows × 16 × 2 bytes = **224 bytes per block**. The prune fires after pair 4 (10/14 dims covered).
+
+### Calibration parameters
+
+| Parameter | Value | Note |
+|---|---|---|
+| `k` (clusters) | 4096 | K-means cluster count used at build time |
+| `NPROBE` | 4 | Clusters probed per query |
+| Quantization scale | ×10000 | int16, range ±10000 |
+| Block size | 8 vectors | For AVX2 8-wide SIMD |
+| Repair condition | cnt ∈ [1, 4] | Triggers full index scan when result is ambiguous |
+
+With these settings the index achieves 6000/6000 recall at p99 ≈ 0.22 ms on the full reference dataset.
+
+## Feature normalization
+
+14-dimensional feature vector per transaction:
+
+| # | Feature | Normalization |
+|---|---|---|
+| 0 | amount | clamp(amount / max_amount) |
+| 1 | installments | clamp(installments / max_installments) |
+| 2 | amount_vs_avg | clamp((amount / cust_avg) / max_ratio) |
+| 3 | hour_of_day | hour / 23 |
+| 4 | day_of_week | weekday / 6 (Mon=0) |
+| 5 | minutes_since_last_tx | clamp(diff_min / max_minutes), -1 if no prior tx |
+| 6 | km_from_last_tx | clamp(km / max_km), -1 if no prior tx |
+| 7 | km_from_home | clamp(km / max_km) |
+| 8 | tx_count_24h | clamp(count / max_count) |
+| 9 | is_online | 0 / 1 |
+| 10 | card_present | 0 / 1 |
+| 11 | unknown_merchant | 1 if merchant not in customer's known list |
+| 12 | mcc_risk | lookup in mcc_risk.json, default 0.5 |
+| 13 | merchant_avg_amount | clamp(merchant_avg / max_merchant_avg) |
+
+Timestamp parsing and weekday computation are done inline without `timegm` or `mktime` — using Howard Hinnant's civil-to-epoch formula and Tomohiko Sakamoto's weekday algorithm.
+
+Normalization constants (`max_amount`, `max_km`, etc.) are preloaded from `normalization.json` as reciprocals to replace divisions with multiplications at query time.
+
+## Repository layout
+
+- `src/converter.cpp` — reads `references.json[.gz]`, runs K-means, writes the binary IVF index
+- `src/server.cpp` — epoll HTTP server, parses requests, queries IVF, responds
+- `src/lb.cpp` — round-robin load balancer using SCM_RIGHTS fd passing
+- `src/ivf.hpp` — IVF index: layout, centroid SoA build, cluster scan, repair pass
+- `src/normalizer.hpp` — feature extraction and quantization
+- `src/types.hpp` — shared binary format (IndexHeader, IndexLayout, constants)
+- `resources/` — JSON inputs: `references.json[.gz]`, `mcc_risk.json`
+
+## Build
+
 ```bash
-# from repo root
 make install-deps
 make build
 
-# convert JSON references to binary (if you have references.json or .gz in resources/)
+# convert references to binary IVF index
 ./build/converter resources/references.json resources/references.bin
 
-# run api_server (example)
-./build/api_server build/resources/normalization.json resources/mcc_risk.json
+# run a backend instance directly (normally done by docker-compose)
+./build/api_server /tmp/ctrl.sock resources/references.bin resources/normalization.json resources/mcc_risk.json
 ```
 
-**Docker**
+## Docker
 
-Build and run with Docker:
 ```bash
 docker-compose up --build
 ```
 
-**License**
-This project is released under the MIT License — see the `LICENSE` file in the repository root for details.
+## License
 
-**License (short)**: MIT
+MIT — see [LICENSE](LICENSE).

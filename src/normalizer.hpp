@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -40,7 +42,7 @@ class Normalizer {
     dom::element doc;
     auto error = parser.load(mcc_path).get(doc);
     if (error) {
-      std::cerr << "Erro ao carregar mcc_risk.json\n";
+      std::cerr << "[ERR] failed to load mcc_risk.json\n";
       return false;
     }
 
@@ -51,7 +53,7 @@ class Normalizer {
     // Load normalization constants and precompute reciprocals
     error = parser.load(norm_path).get(doc);
     if (error) {
-      std::cerr << "Erro ao carregar normalization.json\n";
+      std::cerr << "[ERR] failed to load normalization.json\n";
       return false;
     }
 
@@ -104,6 +106,18 @@ class Normalizer {
     return (dow + 6) % 7;
   }
 
+  void normalize(dom::element& req, int16_t* out) {
+    float vec[14];
+    normalize(req, vec);
+    for (int i = 0; i < 14; i++) {
+      // Use double + llround to match converter.cpp's quantize() exactly.
+      double v = (double)vec[i] * 10000.0;
+      if (v < -10000.0) v = -10000.0;
+      if (v > 10000.0) v = 10000.0;
+      out[i] = (int16_t)std::llround(v);
+    }
+  }
+
   void normalize(dom::element& req, float* vec) {
     dom::element transaction = req["transaction"];
     dom::element customer = req["customer"];
@@ -127,7 +141,7 @@ class Normalizer {
     bool card_present = terminal["card_present"].get_bool();
     float km_from_home = (float)terminal["km_from_home"].get_double();
 
-    // 0. amount — no round4, KNN doesn't need it
+    // 0. amount — no round4, ball tree doesn't need it
     vec[0] = clampf(amount * inv_max_amount);
 
     // 1. installments

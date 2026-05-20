@@ -1,4 +1,4 @@
-name: Build and Push Rinha Image
+name: build
 
 on:
   push:

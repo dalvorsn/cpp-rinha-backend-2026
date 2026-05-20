@@ -25,7 +25,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(simdjson)
 
-# ── converter: build the ball-tree index at image-build time ─────────────────
+# ── converter: build the IVF index at image-build time ───────────────────────
 add_executable(converter src/converter.cpp)
 target_link_libraries(converter PRIVATE simdjson::simdjson)
 target_include_directories(converter PRIVATE src)

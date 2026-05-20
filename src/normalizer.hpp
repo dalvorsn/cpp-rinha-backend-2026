@@ -42,7 +42,7 @@ class Normalizer {
     dom::element doc;
     auto error = parser.load(mcc_path).get(doc);
     if (error) {
-      std::cerr << "Erro ao carregar mcc_risk.json\n";
+      std::cerr << "[ERR] failed to load mcc_risk.json\n";
       return false;
     }
 
@@ -53,7 +53,7 @@ class Normalizer {
     // Load normalization constants and precompute reciprocals
     error = parser.load(norm_path).get(doc);
     if (error) {
-      std::cerr << "Erro ao carregar normalization.json\n";
+      std::cerr << "[ERR] failed to load normalization.json\n";
       return false;
     }
 
@@ -113,7 +113,7 @@ class Normalizer {
       // Use double + llround to match converter.cpp's quantize() exactly.
       double v = (double)vec[i] * 10000.0;
       if (v < -10000.0) v = -10000.0;
-      if (v >  10000.0) v =  10000.0;
+      if (v > 10000.0) v = 10000.0;
       out[i] = (int16_t)std::llround(v);
     }
   }

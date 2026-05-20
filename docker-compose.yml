@@ -1,5 +1,5 @@
 x-api: &api-common
-  image: dalvorsn/rinha-backend-2026:preview
+  image: dalvorsn/rinha-backend-2026:latest
   pull_policy: always
   volumes:
     - socks:/run/sock
@@ -25,7 +25,7 @@ services:
     command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   lb:
-    image: dalvorsn/rinha-backend-2026:preview
+    image: dalvorsn/rinha-backend-2026:latest
     pull_policy: always
     container_name: lb
     depends_on:

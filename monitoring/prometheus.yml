@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'rinha'
+    static_configs:
+      - targets: ['api1:9901']
+        labels:
+          instance: 'api1'
+      - targets: ['api2:9902']
+        labels:
+          instance: 'api2'
+
+  - job_name: 'lb'
+    static_configs:
+      - targets: ['lb:9998']
+        labels:
+          instance: 'lb'

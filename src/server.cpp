@@ -15,20 +15,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 
+#include "apm.hpp"
 #include "ivf.hpp"
 #include "normalizer.hpp"
 #include "simdjson.h"
 
-namespace fs = std::filesystem;
 using namespace simdjson;
 
-#ifdef DEBUG
-#define DLOG(...) fprintf(stderr, "[DBG] " __VA_ARGS__)
-#else
-#define DLOG(...) ((void)0)
-#endif
+APM apm;
 
 // ---------------------------------------------------------------------------
 // Pre-rendered HTTP responses
@@ -71,17 +66,24 @@ struct Conn {
   int buf_len = 0;
   int headers_size = 0;
   int content_len = 0;
-  bool is_fraud = false;
+  bool is_metrics = false;
   const char* send_ptr = nullptr;
   int send_len = 0;
   int send_off = 0;
+  uint64_t req_start_ns = 0;  // set when first byte of current request arrives
+  uint64_t ready_ns =
+      0;  // set when epoll_wait returns with EPOLLIN for this fd
 };
 
 static Conn* conns[MAX_FDS] = {};
 static IVF* ivf = nullptr;
 static Normalizer normalizer;
 static int epfd = -1;
-static int ctrl_fd = -1;
+static int ctrl_listen_fd = -1;
+#ifdef ENABLE_APM
+static int metrics_listen_fd = -1;
+#endif
+static bool is_ctrl_fd[MAX_FDS];
 
 static Conn* get_conn(int fd) {
   if (fd < 0 || fd >= MAX_FDS) return nullptr;
@@ -90,16 +92,20 @@ static Conn* get_conn(int fd) {
   c->buf_len = 0;
   c->headers_size = 0;
   c->content_len = 0;
-  c->is_fraud = false;
+  c->is_metrics = false;
   c->send_ptr = nullptr;
   c->send_len = 0;
   c->send_off = 0;
+  c->req_start_ns = 0;
   return c;
 }
 
 static void drop_conn(int fd) {
-  DLOG("drop fd=%d\n", fd);
   epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+#ifdef ENABLE_APM
+  if (fd >= 0 && fd < MAX_FDS && conns[fd] && !conns[fd]->is_metrics)
+    apm.addGauge("rinha_active_conns", -1);
+#endif
   close(fd);
 }
 
@@ -154,19 +160,220 @@ static int recv_fd(int sock) {
 
   int new_fd;
   memcpy(&new_fd, CMSG_DATA(cmsg), sizeof(int));
-  DLOG("recv_fd: got fd=%d\n", new_fd);
   return new_fd;
 }
 
 // ---------------------------------------------------------------------------
+// Accept new ctrl connection from an lb thread
+// ---------------------------------------------------------------------------
+static void accept_ctrl_conn() {
+  for (;;) {
+    int cfd = accept4(ctrl_listen_fd, nullptr, nullptr, SOCK_NONBLOCK);
+    if (cfd < 0) return;
+    if (cfd >= MAX_FDS) {
+      close(cfd);
+      continue;
+    }
+    is_ctrl_fd[cfd] = true;
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLRDHUP;
+    ev.data.fd = cfd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Drain all fds from LB via SCM_RIGHTS
+// ---------------------------------------------------------------------------
+static void accept_from_lb(int ctrl) {
+  while (true) {
+    int cfd = recv_fd(ctrl);
+    if (cfd < 0) return;
+
+    if (cfd >= MAX_FDS) {
+      fprintf(stderr, "[ERR] fd=%d >= MAX_FDS\n", cfd);
+      close(cfd);
+      continue;
+    }
+
+    int flags = fcntl(cfd, F_GETFL, 0);
+    if (flags >= 0) fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
+
+    int yes = 1;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+    setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &yes, sizeof(yes));
+
+    get_conn(cfd);
+#ifdef ENABLE_APM
+    if (conns[cfd]) {
+      conns[cfd]->req_start_ns = APM::now_ns();
+      apm.addGauge("rinha_active_conns", 1);
+    }
+#endif
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLRDHUP;
+    ev.data.fd = cfd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
+      fprintf(stderr, "[ERR] epoll_ctl ADD fd=%d: %s\n", cfd, strerror(errno));
+      drop_conn(cfd);
+    }
+  }
+}
+
+#ifdef ENABLE_APM
+// ---------------------------------------------------------------------------
+// Metrics connections — accept and serve Prometheus text format on scrape
+// ---------------------------------------------------------------------------
+static void accept_metrics_conn() {
+  int cfd = accept4(metrics_listen_fd, nullptr, nullptr, SOCK_NONBLOCK);
+  if (cfd < 0) return;
+  if (cfd >= MAX_FDS) {
+    close(cfd);
+    return;
+  }
+  Conn* c = get_conn(cfd);
+  c->is_metrics = true;
+  struct epoll_event ev;
+  ev.events = EPOLLIN | EPOLLRDHUP;
+  ev.data.fd = cfd;
+  epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev);
+}
+
+static void handle_metrics_read(int fd, Conn* c) {
+  int room = BUF_CAP - c->buf_len;
+  if (room <= 0) {
+    drop_conn(fd);
+    return;
+  }
+  ssize_t n = recv(fd, c->buf + c->buf_len, room, 0);
+  if (n <= 0) {
+    drop_conn(fd);
+    return;
+  }
+  c->buf_len += (int)n;
+  if (!memmem(c->buf, c->buf_len, "\r\n\r\n", 4)) return;
+
+  static char snap[262144];
+  int snap_len;
+  apm.scrape(snap, snap_len);
+  char hdr[128];
+  int hdr_len = snprintf(hdr, sizeof(hdr),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/plain; version=0.0.4\r\n"
+                         "Content-Length: %d\r\n\r\n",
+                         snap_len);
+  // Switch to blocking so the full response is sent before close
+  int fl = fcntl(fd, F_GETFL);
+  fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+  send(fd, hdr, hdr_len, MSG_NOSIGNAL);
+  send(fd, snap, snap_len, MSG_NOSIGNAL);
+  drop_conn(fd);
+}
+#endif  // ENABLE_APM
+
+// ---------------------------------------------------------------------------
 // Handle readable/writable client fds
 // ---------------------------------------------------------------------------
+// Returns 0–5 (response index) or 6 (error).
+static int score_transaction(Conn* c) {
+  thread_local dom::parser parser;
+  const char* body = c->buf + c->headers_size;
+  int blen = c->content_len;
+  dom::element doc;
+
+#ifdef ENABLE_APM
+  {
+    uint64_t t0 = APM::now_ns();
+    if (c->ready_ns && t0 > c->ready_ns)
+      apm.push("rinha_queue_ms", t0 - c->ready_ns);
+    if (c->req_start_ns && t0 > c->req_start_ns) {
+      apm.push("rinha_arrival_wait_ms", t0 - c->req_start_ns);
+      c->req_start_ns = 0;
+    }
+  }
+  apm.startRecord("rinha_latency_ms");
+  apm.startRecord("rinha_parse_ms");
+#endif
+
+  bool ok;
+  if (c->headers_size + blen + (int)SIMDJSON_PADDING <= BUF_CAP) {
+    memset(c->buf + c->headers_size + blen, 0, SIMDJSON_PADDING);
+    ok = !parser.parse(body, (size_t)blen, false).get(doc);
+  } else {
+    padded_string padded(body, (size_t)blen);
+    ok = !parser.parse(padded).get(doc);
+  }
+
+#ifdef ENABLE_APM
+  apm.stopRecord("rinha_parse_ms");
+#endif
+
+  if (!ok) return 6;
+
+  try {
+    int16_t vec[14];
+#ifdef ENABLE_APM
+    apm.startRecord("rinha_normalize_ms");
+#endif
+    normalizer.normalize(doc, vec);
+#ifdef ENABLE_APM
+    apm.stopRecord("rinha_normalize_ms");
+    apm.startRecord("rinha_ivf_ms");
+#endif
+    int cnt = ivf->get_fraud_count(vec);
+#ifdef ENABLE_APM
+    apm.stopRecord("rinha_ivf_ms");
+    apm.stopRecord("rinha_latency_ms");
+    apm.recordRequest();
+#endif
+    return cnt;
+  } catch (...) {
+    fprintf(stderr, "[ERR] ivf/normalize threw\n");
+    return 6;
+  }
+}
+
+static void send_response(int fd, Conn* c, int score) {
+  const char* resp;
+  int resp_len;
+  if (score <= 5) {
+    resp = full_resp[score];
+    resp_len = full_resp_len[score];
+  } else {
+    resp = ERR_RESP;
+    resp_len = ERR_RESP_LEN;
+  }
+
+  ssize_t sent = send(fd, resp, resp_len, MSG_NOSIGNAL);
+  if (sent < 0) {
+    if (errno != EAGAIN) drop_conn(fd);
+    return;
+  }
+  if (sent < resp_len) {
+    c->send_ptr = resp;
+    c->send_len = resp_len;
+    c->send_off = (int)sent;
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+  }
+}
+
 static void handle_client_read(int fd) {
   Conn* c = (fd >= 0 && fd < MAX_FDS) ? conns[fd] : nullptr;
   if (!c) {
     drop_conn(fd);
     return;
   }
+
+#ifdef ENABLE_APM
+  if (c->is_metrics) {
+    handle_metrics_read(fd, c);
+    return;
+  }
+#endif
 
   int room = BUF_CAP - c->buf_len;
   if (room <= 0) {
@@ -184,81 +391,33 @@ static void handle_client_read(int fd) {
     drop_conn(fd);
     return;
   }
+
   c->buf_len += (int)n;
-  DLOG("fd=%d recv %zd bytes (total=%d)\n", fd, n, c->buf_len);
 
   if (c->headers_size == 0) {
     const char* hdrend = (const char*)memmem(c->buf, c->buf_len, "\r\n\r\n", 4);
     if (!hdrend) return;
     c->headers_size = (int)(hdrend - c->buf) + 4;
-    c->is_fraud = (c->buf[0] == 'P');
-    if (c->is_fraud)
+    if (c->buf[0] == 'P')
       c->content_len = parse_content_length(c->buf, c->headers_size);
-    DLOG("fd=%d hdr=%d fraud=%d clen=%d\n", fd, c->headers_size, c->is_fraud,
-         c->content_len);
   }
 
-  int body_have = c->buf_len - c->headers_size;
-  if (c->is_fraud && body_have < c->content_len) return;
+  const bool is_post = c->buf[0] == 'P';
+  if (is_post && c->buf_len - c->headers_size < c->content_len) return;
 
-  const char* resp = READY_RESP;
-  int resp_len = READY_RESP_LEN;
+  int score = is_post ? score_transaction(c) : -1;
 
-  if (c->is_fraud) {
-    thread_local dom::parser parser;
-    const char* body = c->buf + c->headers_size;
-    int blen = c->content_len;
-    dom::element doc;
-    bool ok;
-    if (c->headers_size + blen + (int)SIMDJSON_PADDING <= BUF_CAP) {
-      // Parse in-place: zero the 64-byte padding region after the body,
-      // then parse without copying (saves one malloc/free per request).
-      memset(c->buf + c->headers_size + blen, 0, SIMDJSON_PADDING);
-      ok = !parser.parse(body, (size_t)blen, false).get(doc);
-    } else {
-      padded_string padded(body, (size_t)blen);
-      ok = !parser.parse(padded).get(doc);
-    }
-    if (ok) {
-      try {
-        int16_t vec[14];
-        normalizer.normalize(doc, vec);
-        int cnt = ivf->get_fraud_count(vec);
-        DLOG("fd=%d fraud_count=%d\n", fd, cnt);
-        resp = full_resp[cnt];
-        resp_len = full_resp_len[cnt];
-      } catch (...) {
-        fprintf(stderr, "[ERR] fd=%d ivf/normalize threw\n", fd);
-        ok = false;
-      }
-    }
-    if (!ok) {
-      resp = ERR_RESP;
-      resp_len = ERR_RESP_LEN;
-    }
-  }
-
-  int consumed = c->headers_size + (c->is_fraud ? c->content_len : 0);
+  int consumed = c->headers_size + (is_post ? c->content_len : 0);
   int leftover = c->buf_len - consumed;
   if (leftover > 0) memmove(c->buf, c->buf + consumed, leftover);
   c->buf_len = leftover;
   c->headers_size = 0;
   c->content_len = 0;
 
-  ssize_t sent = send(fd, resp, resp_len, MSG_NOSIGNAL);
-  DLOG("fd=%d send %d → sent=%zd\n", fd, resp_len, sent);
-  if (sent < 0) {
-    if (errno != EAGAIN) drop_conn(fd);
-    return;
-  }
-  if (sent < resp_len) {
-    c->send_ptr = resp;
-    c->send_len = resp_len;
-    c->send_off = (int)sent;
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
-    ev.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+  if (score < 0) {
+    send(fd, READY_RESP, READY_RESP_LEN, MSG_NOSIGNAL);
+  } else {
+    send_response(fd, c, score);
   }
 }
 
@@ -286,52 +445,19 @@ static void handle_client_write(int fd) {
 }
 
 // ---------------------------------------------------------------------------
-// Drain all fds from LB via SCM_RIGHTS
-// ---------------------------------------------------------------------------
-static void accept_from_lb() {
-  while (true) {
-    int client_fd = recv_fd(ctrl_fd);
-    if (client_fd < 0) return;
-
-    if (client_fd >= MAX_FDS) {
-      fprintf(stderr, "[ERR] fd=%d >= MAX_FDS\n", client_fd);
-      close(client_fd);
-      continue;
-    }
-
-    int flags = fcntl(client_fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
-    int yes = 1;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_QUICKACK, &yes, sizeof(yes));
-
-    get_conn(client_fd);
-
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLRDHUP;
-    ev.data.fd = client_fd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
-      fprintf(stderr, "[ERR] epoll_ctl ADD fd=%d: %s\n", client_fd,
-              strerror(errno));
-      drop_conn(client_fd);
-    } else {
-      DLOG("new client fd=%d\n", client_fd);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Control socket setup
+// Control socket setup (stays open, accepts one connection per lb thread)
 // ---------------------------------------------------------------------------
 static int create_ctrl_socket(const char* path) {
-  fs::path p(path);
-  if (p.has_parent_path()) {
-    std::error_code ec;
-    fs::create_directories(p.parent_path(), ec);
+  char dir[256];
+  strncpy(dir, path, sizeof(dir) - 1);
+  char* slash = strrchr(dir, '/');
+  if (slash && slash > dir) {
+    *slash = '\0';
+    mkdir(dir, 0755);
   }
   unlink(path);
 
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
   if (fd < 0) return -1;
 
   struct sockaddr_un addr = {};
@@ -342,17 +468,41 @@ static int create_ctrl_socket(const char* path) {
     close(fd);
     return -1;
   }
-  listen(fd, 8);
+  listen(fd, 32);
   chmod(path, 0777);
   return fd;
 }
+
+#ifdef ENABLE_APM
+// ---------------------------------------------------------------------------
+// Metrics TCP socket (Prometheus scrape target, optional)
+// ---------------------------------------------------------------------------
+static int create_metrics_socket(int port) {
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (fd < 0) return -1;
+  int yes = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_port = htons((uint16_t)port);
+  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    close(fd);
+    return -1;
+  }
+  listen(fd, 8);
+  return fd;
+}
+#endif  // ENABLE_APM
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
   if (argc < 5) {
-    fprintf(stderr, "Usage: %s <ctrl_path> <data.bin> <norm.json> <mcc.json>\n",
+    fprintf(stderr,
+            "Usage: %s <ctrl_path> <data.bin> <norm.json> <mcc.json> "
+            "[metrics_port]\n",
             argv[0]);
     return 1;
   }
@@ -362,6 +512,37 @@ int main(int argc, char* argv[]) {
                                 "%sContent-Length: %zu\r\n\r\n%s", RESP_HDRS,
                                 strlen(BODIES[i]), BODIES[i]);
   }
+
+#ifdef ENABLE_APM
+  apm.registerMetric("rinha_latency_ms",
+                     "End-to-end request latency (parse+norm+ivf)");
+  apm.registerMetric("rinha_queue_ms",
+                     "Within-batch wait: epoll_wait returned to score_transaction called");
+  apm.registerMetric("rinha_arrival_wait_ms",
+                     "True wait: LB handoff (accept_from_lb) to score_transaction start");
+  apm.registerMetric("rinha_parse_ms", "JSON parsing stage latency");
+  apm.registerMetric("rinha_normalize_ms", "Feature normalization stage latency");
+  apm.registerMetric("rinha_ivf_ms",
+                     "IVF nearest-neighbor search latency (includes repair)");
+  apm.registerMetric("rinha_epoll_batch_size",
+                     "Events per epoll_wait return (encoded: push N*1000 => bucket[N])");
+  apm.registerGauge("rinha_active_conns", "Active client connections");
+  {
+    FILE* f = fopen("/sys/fs/cgroup/cpu.max", "r");
+    if (f) {
+      char quota_str[32];
+      unsigned long period = 100000;
+      if (fscanf(f, "%31s %lu", quota_str, &period) == 2 &&
+          strcmp(quota_str, "max") != 0) {
+        unsigned long quota = strtoul(quota_str, nullptr, 10);
+        apm.cpu_limit_cores = (double)quota / (double)period;
+        fprintf(stderr, "[INFO] cgroup CPU limit: %.3f cores\n",
+                apm.cpu_limit_cores);
+      }
+      fclose(f);
+    }
+  }
+#endif
 
   fprintf(stderr, "[INFO] loading IVF index: %s\n", argv[2]);
   ivf = new IVF(argv[2]);
@@ -374,58 +555,92 @@ int main(int argc, char* argv[]) {
   }
   fprintf(stderr, "[INFO] normalizer loaded\n");
 
-  int listen_ctrl = create_ctrl_socket(argv[1]);
-  if (listen_ctrl < 0) {
+#ifdef ENABLE_APM
+  apm.init();
+#endif
+
+  ctrl_listen_fd = create_ctrl_socket(argv[1]);
+  if (ctrl_listen_fd < 0) {
     perror("ctrl socket");
     return 1;
   }
   fprintf(stderr, "[INFO] ctrl socket: %s\n", argv[1]);
 
-  fprintf(stderr, "[INFO] waiting for LB...\n");
-  ctrl_fd = accept(listen_ctrl, nullptr, nullptr);
-  if (ctrl_fd < 0) {
-    perror("accept ctrl");
-    return 1;
+#ifdef ENABLE_APM
+  if (argc >= 6) {
+    int mport = atoi(argv[5]);
+    metrics_listen_fd = create_metrics_socket(mport);
+    if (metrics_listen_fd < 0)
+      fprintf(stderr, "[WARN] metrics socket on port %d failed\n", mport);
+    else
+      fprintf(stderr, "[INFO] metrics on :%d\n", mport);
   }
-  close(listen_ctrl);
-  fprintf(stderr, "[INFO] LB connected\n");
-
-  {
-    int fl = fcntl(ctrl_fd, F_GETFL, 0);
-    fcntl(ctrl_fd, F_SETFL, fl | O_NONBLOCK);
-  }
+#endif
 
   epfd = epoll_create1(0);
   struct epoll_event ev;
   ev.events = EPOLLIN;
-  ev.data.fd = ctrl_fd;
-  epoll_ctl(epfd, EPOLL_CTL_ADD, ctrl_fd, &ev);
+  ev.data.fd = ctrl_listen_fd;
+  epoll_ctl(epfd, EPOLL_CTL_ADD, ctrl_listen_fd, &ev);
+
+#ifdef ENABLE_APM
+  if (metrics_listen_fd >= 0) {
+    ev.events = EPOLLIN;
+    ev.data.fd = metrics_listen_fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, metrics_listen_fd, &ev);
+  }
+#endif
 
   fprintf(stderr, "Server ready\n");
 
   struct epoll_event events[MAX_EVTS];
   while (true) {
-    int nfds = epoll_wait(epfd, events, MAX_EVTS, -1);
+    int nfds = epoll_wait(epfd, events, MAX_EVTS, 1);
     if (nfds < 0) {
       if (errno == EINTR) continue;
       perror("epoll_wait");
       break;
     }
+    if (nfds == 0) continue;
+#ifdef ENABLE_APM
+    apm.push("rinha_epoll_batch_size", (uint64_t)nfds * 1000);
+#endif
     for (int i = 0; i < nfds; i++) {
       int fd = events[i].data.fd;
       uint32_t e = events[i].events;
 
-      if (fd == ctrl_fd) {
-        accept_from_lb();
+      if (fd == ctrl_listen_fd) {
+        accept_ctrl_conn();
         continue;
       }
+      if (fd < MAX_FDS && is_ctrl_fd[fd]) {
+        if (e & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+          epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+          is_ctrl_fd[fd] = false;
+          close(fd);
+        } else if (e & EPOLLIN) {
+          accept_from_lb(fd);
+        }
+        continue;
+      }
+#ifdef ENABLE_APM
+      if (fd == metrics_listen_fd) {
+        accept_metrics_conn();
+        continue;
+      }
+#endif
 
       if (e & (EPOLLHUP | EPOLLERR)) {
         drop_conn(fd);
         continue;
       }
+      if (e & EPOLLIN) {
+#ifdef ENABLE_APM
+        if (fd >= 0 && fd < MAX_FDS && conns[fd]) conns[fd]->ready_ns = APM::now_ns();
+#endif
+        handle_client_read(fd);
+      }
       if (e & EPOLLOUT) handle_client_write(fd);
-      if (e & EPOLLIN) handle_client_read(fd);
       if (e & EPOLLRDHUP) drop_conn(fd);
     }
   }

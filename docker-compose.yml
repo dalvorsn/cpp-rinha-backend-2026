@@ -1,6 +1,7 @@
 x-api: &api-common
   image: dalvorsn/rinha-backend-2026:profiling
   pull_policy: always
+  command: ./api_server
   volumes:
     - socks:/run/sock
   ulimits:
@@ -13,16 +14,28 @@ x-api: &api-common
         cpus: '0.40'
         memory: 160M
 
+x-api-env: &api-env
+  API_REFERENCES: resources/references.bin
+  API_NORMALIZATION: resources/normalization.json
+  API_MCC_RISK: resources/mcc_risk.json
+  API_NPROBE: "12"
+  API_REPAIR_MIN: "1"
+  API_REPAIR_MAX: "4"
+
 services:
   api1:
     <<: *api-common
     container_name: api1
-    command: ./api_server /run/sock/api1.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
+    environment:
+      <<: *api-env
+      API_CTRL: /run/sock/api1.ctrl
 
   api2:
     <<: *api-common
     container_name: api2
-    command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
+    environment:
+      <<: *api-env
+      API_CTRL: /run/sock/api2.ctrl
 
   lb:
     image: dalvorsn/rinha-backend-2026:profiling

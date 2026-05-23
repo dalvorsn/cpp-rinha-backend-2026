@@ -1,5 +1,5 @@
 x-api: &api-common
-  image: dalvorsn/rinha-backend-2026:latest
+  image: dalvorsn/rinha-backend-2026:profiling
   pull_policy: always
   volumes:
     - socks:/run/sock
@@ -10,7 +10,7 @@ x-api: &api-common
   deploy:
     resources:
       limits:
-        cpus: '0.45'
+        cpus: '0.40'
         memory: 160M
 
 services:
@@ -25,7 +25,7 @@ services:
     command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
 
   lb:
-    image: dalvorsn/rinha-backend-2026:latest
+    image: dalvorsn/rinha-backend-2026:profiling
     pull_policy: always
     container_name: lb
     depends_on:
@@ -46,7 +46,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.1'
+          cpus: '0.20'
           memory: 30M
 
 volumes:

@@ -24,7 +24,7 @@ WORKDIR /app
 
 COPY --from=builder /app/build/api_server /app/api_server
 COPY --from=builder /app/build/lb         /app/lb
-COPY --from=builder /app/resources/references.bin     /app/resources/references.bin
+COPY --from=builder /app/resources/references.bin  /app/resources/references.bin
 COPY resources/mcc_risk.json       /app/resources/
 COPY resources/normalization.json  /app/resources/
 

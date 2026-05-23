@@ -78,6 +78,8 @@ struct Conn {
 static Conn* conns[MAX_FDS] = {};
 static IVF* ivf = nullptr;
 static Normalizer normalizer;
+static int g_repair_min = 2;
+static int g_repair_max = 3;
 static int epfd = -1;
 static int ctrl_listen_fd = -1;
 #ifdef ENABLE_APM
@@ -273,6 +275,7 @@ static void handle_metrics_read(int fd, Conn* c) {
 #endif  // ENABLE_APM
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Handle readable/writable client fds
 // ---------------------------------------------------------------------------
 // Returns 0–5 (response index) or 6 (error).
@@ -321,7 +324,11 @@ static int score_transaction(Conn* c) {
     apm.stopRecord("rinha_normalize_ms");
     apm.startRecord("rinha_ivf_ms");
 #endif
-    int cnt = ivf->get_fraud_count(vec);
+    bool repaired = false;
+    int cnt = ivf->get_fraud_count(vec, &repaired);
+#ifdef ENABLE_APM
+    if (repaired) apm.recordRepair();
+#endif
 #ifdef ENABLE_APM
     apm.stopRecord("rinha_ivf_ms");
     apm.stopRecord("rinha_latency_ms");
@@ -499,13 +506,28 @@ static int create_metrics_socket(int port) {
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
-  if (argc < 5) {
+  (void)argc; (void)argv;
+  const char* ctrl_path   = getenv("API_CTRL");
+  const char* refs_path   = getenv("API_REFERENCES");
+  const char* norm_path   = getenv("API_NORMALIZATION");
+  const char* mcc_path    = getenv("API_MCC_RISK");
+  const char* mport_str   = getenv("API_METRICS_PORT");
+  const char* nprobe_str  = getenv("API_NPROBE");
+  const char* rmin_str    = getenv("API_REPAIR_MIN");
+  const char* rmax_str    = getenv("API_REPAIR_MAX");
+
+  if (!ctrl_path || !refs_path || !norm_path || !mcc_path) {
     fprintf(stderr,
-            "Usage: %s <ctrl_path> <data.bin> <norm.json> <mcc.json> "
-            "[metrics_port]\n",
-            argv[0]);
+            "Required env vars: API_CTRL API_REFERENCES "
+            "API_NORMALIZATION API_MCC_RISK\n"
+            "Optional: API_METRICS_PORT API_NPROBE API_REPAIR_MIN "
+            "API_REPAIR_MAX\n");
     return 1;
   }
+
+  int g_nprobe = nprobe_str ? atoi(nprobe_str) : 4;
+  if (rmin_str) g_repair_min = atoi(rmin_str);
+  if (rmax_str) g_repair_max = atoi(rmax_str);
 
   for (int i = 0; i < 6; i++) {
     full_resp_len[i] = snprintf(full_resp[i], sizeof(full_resp[i]),
@@ -544,12 +566,14 @@ int main(int argc, char* argv[]) {
   }
 #endif
 
-  fprintf(stderr, "[INFO] loading IVF index: %s\n", argv[2]);
-  ivf = new IVF(argv[2]);
+  fprintf(stderr, "[INFO] loading IVF index: %s (nprobe=%d repair=[%d,%d])\n",
+          refs_path, g_nprobe, g_repair_min, g_repair_max);
+  ivf = new IVF(refs_path, g_nprobe, g_repair_min, g_repair_max);
   fprintf(stderr, "[INFO] IVF index loaded\n");
+
   mlockall(MCL_CURRENT);
 
-  if (!normalizer.load_config(argv[4], argv[3])) {
+  if (!normalizer.load_config(mcc_path, norm_path)) {
     fprintf(stderr, "[ERR] failed to load normalizer config\n");
     return 1;
   }
@@ -559,16 +583,16 @@ int main(int argc, char* argv[]) {
   apm.init();
 #endif
 
-  ctrl_listen_fd = create_ctrl_socket(argv[1]);
+  ctrl_listen_fd = create_ctrl_socket(ctrl_path);
   if (ctrl_listen_fd < 0) {
     perror("ctrl socket");
     return 1;
   }
-  fprintf(stderr, "[INFO] ctrl socket: %s\n", argv[1]);
+  fprintf(stderr, "[INFO] ctrl socket: %s\n", ctrl_path);
 
 #ifdef ENABLE_APM
-  if (argc >= 6) {
-    int mport = atoi(argv[5]);
+  if (mport_str) {
+    int mport = atoi(mport_str);
     metrics_listen_fd = create_metrics_socket(mport);
     if (metrics_listen_fd < 0)
       fprintf(stderr, "[WARN] metrics socket on port %d failed\n", mport);

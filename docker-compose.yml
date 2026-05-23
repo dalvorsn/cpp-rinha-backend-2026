@@ -1,6 +1,7 @@
 x-api: &api-common
   build:
     context: .
+  command: ./api_server
   volumes:
     - socks:/run/sock
   ulimits:
@@ -13,16 +14,30 @@ x-api: &api-common
         cpus: '0.4'
         memory: 150M
 
+x-api-env: &api-env
+  API_REFERENCES: resources/references.bin
+  API_NORMALIZATION: resources/normalization.json
+  API_MCC_RISK: resources/mcc_risk.json
+  API_REPAIR_MIN: "1"
+  API_REPAIR_MAX: "4"
+  API_NPROBE: "12"
+
 services:
   api1:
     <<: *api-common
     container_name: api1
-    command: ./api_server /run/sock/api1.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json 9901
+    environment:
+      <<: *api-env
+      API_CTRL: /run/sock/api1.ctrl
+      API_METRICS_PORT: "9901"
 
   api2:
     <<: *api-common
     container_name: api2
-    command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json 9902
+    environment:
+      <<: *api-env
+      API_CTRL: /run/sock/api2.ctrl
+      API_METRICS_PORT: "9902"
     
   lb:
     build:

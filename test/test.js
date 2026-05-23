@@ -2,7 +2,7 @@ import http from 'k6/http';
 import { check } from 'k6';
 import { SharedArray } from 'k6/data';
 import { Counter } from 'k6/metrics';
-import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
+import { textSummary } from './k6-summary.js';
 import exec from 'k6/execution';
 
 const testData = new SharedArray('test-data', function () {
@@ -19,11 +19,8 @@ const fpCount = new Counter('fp_count');
 const fnCount = new Counter('fn_count');
 const errorCount = new Counter('error_count');
 
-const fpEntries = [];
-
 export const options = {
-    // Adicionado 'avg' e 'med' para você ter mais visibilidade do tempo durante o teste
-    summaryTrendStats: ['avg', 'med', 'p(99)'],
+    summaryTrendStats: ['p(99)'],
     systemTags: ['status', 'method'],
     dns: {
         ttl: '5m',
@@ -46,11 +43,10 @@ export const options = {
 
 export function setup() {
     console.log(
-        `\n=== INICIANDO TESTE ===`
-        + `\nDataset: ${expectedStats.total} entries, `
+        `Dataset: ${expectedStats.total} entries, `
         + `${expectedStats.fraud_count} fraud (${expectedStats.fraud_rate}%), `
         + `${expectedStats.legit_count} legit (${expectedStats.legit_rate}%), `
-        + `edge cases: ${expectedStats.edge_case_rate}%\n`
+        + `edge cases: ${expectedStats.edge_case_rate}%`
     );
 }
 
@@ -69,24 +65,20 @@ export default function () {
     if (res.status === 200) {
         const body = JSON.parse(res.body);
         if (expectedApproved === body.approved) {
-            if (body.approved) tnCount.add(1); 
-            else tpCount.add(1);               
+            if (body.approved) tnCount.add(1);
+            else tpCount.add(1);
         } else {
-            if (body.approved) fnCount.add(1);
-            else {
+            if (body.approved) {
+                fnCount.add(1);
+                console.warn(`[FN] idx=${idx} fraud_score=${body.fraud_score} req=${JSON.stringify(entry.request)}`);
+            } else {
                 fpCount.add(1);
-                console.warn(`[FALSO POSITIVO] idx=${idx} - Transação legítima bloqueada! Request: ${JSON.stringify(entry.request)}`);
-                fpEntries.push({ idx, request: entry.request });
+                console.warn(`[FP] idx=${idx} fraud_score=${body.fraud_score} req=${JSON.stringify(entry.request)}`);
             }
         }
     } else {
         errorCount.add(1);
-    }
-
-    // PRINT EM TEMPO REAL: A cada 5000 requisições globais do teste,
-    // ele joga um snapshot rápido de como está a acurácia no terminal
-    if (idx % 5000 === 0 && idx > 0) {
-        console.log(`[Progresso] Requisições processadas: ${idx}...`);
+        console.warn(`[ERR] idx=${idx} status=${res.status} req=${JSON.stringify(entry.request)}`);
     }
 }
 
@@ -112,11 +104,14 @@ export function handleSummary(data) {
 
     const N = tp + tn + fp + fn + errs;
 
+    // Erros ponderados (para a fórmula log) e contagem pura (para o corte)
     const E = (fp * 1) + (fn * 3) + (errs * 5);
     const failures = fp + fn + errs;
     const epsilon = N > 0 ? E / N : 0;
     const failureRate = N > 0 ? failures / N : 0;
 
+    // Score P99 (log, com teto em P99_MIN_MS e corte em P99_MAX_MS).
+    // p99=0 = nenhuma resposta completou; retorna 0 pra evitar Infinity no JSON.
     let p99Score;
     let p99CutTriggered = false;
     if (p99 <= 0) {
@@ -128,6 +123,7 @@ export function handleSummary(data) {
         p99Score = K * Math.log10(T_MAX_MS / Math.max(p99, P99_MIN_MS));
     }
 
+    // Score detecção (log com penalidade absoluta, ou corte em -3000 se falhas > 15%)
     let detScore;
     let rateComponent = 0;
     let absolutePenalty = 0;
@@ -171,25 +167,8 @@ export function handleSummary(data) {
         },
     };
 
-    // LOG DO SCORE FINAL NO TERMINAL: Mostra um resumão direto na tela antes de fechar
-    console.log(`\n=== RESULTADOS DO SCORE ===`);
-    console.log(`Final Score:    ${finalScore.toFixed(2)}`);
-    console.log(`P99 Latency:    ${p99.toFixed(2)}ms (Score: ${p99Score.toFixed(2)})`);
-    console.log(`Failure Rate:   ${(failureRate * 100).toFixed(2)}% (Fails: ${failures} de ${N})`);
-    console.log(`Métricas:       TP: ${tp} | TN: ${tn} | FP: ${fp} | FN: ${fn} | Erros: ${errs}`);
-    console.log(`===========================\n`);
-
-    if (fpEntries.length > 0) {
-        console.log(`\n=== FALSOS POSITIVOS (${fpEntries.length} transações legítimas bloqueadas) ===`);
-        for (const e of fpEntries) {
-            console.log(`  [idx=${e.idx}] ${JSON.stringify(e.request)}`);
-        }
-        console.log(`=======================================================\n`);
-    }
-
     return {
         'test/results.json': JSON.stringify(result, null, 2),
-        // MUDANÇA: Descomentado para ativar o output padrão detalhado do k6 por cima do JSON
-        stdout: textSummary(data, { indent: ' ', enableColors: true }),
+        //stdout: textSummary(data, { indent: ' ', enableColors: true }),
     };
 }

@@ -14,7 +14,11 @@
 
 class IVF {
  public:
-  explicit IVF(const char* filename) {
+  explicit IVF(const char* filename, int nprobe = 4, int repair_min = 2,
+               int repair_max = 3) {
+    nprobe_ = nprobe;
+    repair_min_ = repair_min;
+    repair_max_ = repair_max;
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
       perror("ivf open");
@@ -64,27 +68,28 @@ class IVF {
     free(cpsoa);
   }
 
-  static constexpr int NPROBE = 4;
+  static constexpr int MAX_NPROBE = 16;
 
-  int get_fraud_count(const int16_t* q) const {
-    uint32_t probes[NPROBE];
-    find_top_centroids(q, probes, NPROBE);
+  int get_fraud_count(const int16_t* q, bool* did_repair = nullptr) const {
+    uint32_t probes[MAX_NPROBE];
+    find_top_centroids(q, probes, nprobe_);
 
     uint32_t top_dists[5] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
                              UINT32_MAX};
     uint8_t top_labels[5] = {};
     uint32_t max_top = UINT32_MAX;
 
-    for (int i = 0; i < NPROBE; i++)
+    for (int i = 0; i < nprobe_; i++)
       scan_cluster(probes[i], q, top_dists, top_labels, max_top);
 
     int cnt = 0;
     for (int i = 0; i < 5; i++) cnt += top_labels[i];
 
-    if (cnt >= 1 && cnt <= 4) {
-      repair(q, probes, NPROBE, top_dists, top_labels, max_top);
+    if (cnt >= repair_min_ && cnt <= repair_max_) {
+      repair(q, probes, nprobe_, top_dists, top_labels, max_top);
       cnt = 0;
       for (int i = 0; i < 5; i++) cnt += top_labels[i];
+      if (did_repair) *did_repair = true;
     }
 
     return cnt;
@@ -93,6 +98,10 @@ class IVF {
  private:
   void* file_data = nullptr;
   size_t file_size = 0;
+
+  int nprobe_ = 4;
+  int repair_min_ = 2;
+  int repair_max_ = 3;
 
   uint32_t n = 0;
   uint32_t k = 0;
@@ -150,8 +159,8 @@ class IVF {
     __m256i vq[IVF_PAIRS];
     for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
 
-    uint32_t top_d[NPROBE];
-    uint32_t top_c[NPROBE];
+    uint32_t top_d[MAX_NPROBE];
+    uint32_t top_c[MAX_NPROBE];
     for (int i = 0; i < n; i++) {
       top_d[i] = UINT32_MAX;
       top_c[i] = (uint32_t)i;

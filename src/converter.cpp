@@ -148,74 +148,26 @@ static void train_kmeans(const std::vector<int16_t>& vecs,
   }
 }
 
-// ── main
-// ──────────────────────────────────────────────────────────────────────
+// ── IVF build helper
+// ──────────────────────────────────────────────────────
 
-int main(int argc, char* argv[]) {
-  if (argc < 3) {
-    std::cerr << "Usage: " << argv[0] << " <input.json> <output.bin>"
-              << " [k=" << DEFAULT_K << "]"
-              << " [sample=" << DEFAULT_SAMPLE << "]"
-              << " [iters=" << DEFAULT_ITERS << "]\n";
-    return 1;
-  }
-  const char* input = argv[1];
-  const char* output = argv[2];
-  uint32_t k = argc > 3 ? (uint32_t)std::stoul(argv[3]) : DEFAULT_K;
-  uint32_t sample_sz =
-      argc > 4 ? (uint32_t)std::stoul(argv[4]) : DEFAULT_SAMPLE;
-  int iters = argc > 5 ? std::stoi(argv[5]) : DEFAULT_ITERS;
-
-  // ── Parse references ──────────────────────────────────────────────────────
-  std::cerr << "Parsing " << input << "...\n";
-  ondemand::parser parser;
-  padded_string json;
-  if (padded_string::load(input).get(json)) {
-    std::cerr << "load failed\n";
-    return 1;
-  }
-  ondemand::document doc;
-  if (parser.iterate(json).get(doc)) {
-    std::cerr << "parse failed\n";
-    return 1;
-  }
-
-  std::vector<int16_t> vecs;
-  std::vector<uint8_t> labels;
-  vecs.reserve(size_t(3'000'000) * IVF_DIMS);
-  labels.reserve(3'000'000);
-
-  for (ondemand::object obj : doc.get_array()) {
-    int i = 0;
-    for (double v : obj["vector"].get_array()) {
-      if (i < IVF_DIMS) vecs.push_back(quantize(v));
-      ++i;
-    }
-    std::string_view label;
-    if (obj["label"].get_string().get(label)) {
-      vecs.resize(vecs.size() - IVF_DIMS);
-      continue;
-    }
-    labels.push_back(label == "fraud" ? 1u : 0u);
-  }
+static bool build_ivf(const std::vector<int16_t>& vecs,
+                      const std::vector<uint8_t>& labels, uint32_t k,
+                      uint32_t sample_sz, int iters, const char* output) {
   const uint32_t n = (uint32_t)labels.size();
-  std::cerr << "Loaded " << n << " records\n";
 
-  // ── Sample for k-means ────────────────────────────────────────────────────
   std::mt19937_64 rng(42);
   uint32_t actual_sample = std::min(sample_sz, n);
   std::vector<uint32_t> sample(actual_sample);
   std::uniform_int_distribution<uint32_t> pick_rec(0, n - 1);
   for (auto& s : sample) s = pick_rec(rng);
 
-  // ── K-means ───────────────────────────────────────────────────────────────
-  std::cerr << "K-means++ init (k=" << k << ", sample=" << actual_sample
-            << ")...\n";
+  std::cerr << "K-means++ init (k=" << k << ", n=" << n
+            << ", sample=" << actual_sample << ")...\n";
   auto centroids = init_kmeans_pp(vecs, sample, k, 42);
   std::cerr << "Training...\n";
   train_kmeans(vecs, sample, centroids, iters);
 
-  // ── Assign all vectors ────────────────────────────────────────────────────
   std::cerr << "Assigning " << n << " vectors...\n";
   std::vector<uint32_t> assignment(n);
   std::vector<uint32_t> counts(k, 0);
@@ -228,28 +180,24 @@ int main(int argc, char* argv[]) {
       std::cerr << "  assigned " << i << "/" << n << "\n";
   }
 
-  // ── Block offsets ─────────────────────────────────────────────────────────
   std::vector<uint32_t> block_offsets(k + 1, 0);
   for (uint32_t c = 0; c < k; ++c)
     block_offsets[c + 1] =
         block_offsets[c] + (counts[c] + IVF_BLOCK - 1) / IVF_BLOCK;
   const uint32_t total_blocks = block_offsets[k];
 
-  // ── Sort into cluster order ───────────────────────────────────────────────
   std::vector<uint32_t> starts(k + 1, 0);
   for (uint32_t c = 0; c < k; ++c) starts[c + 1] = starts[c] + counts[c];
   std::vector<uint32_t> cursor = starts;
   std::vector<uint32_t> order(n);
   for (uint32_t i = 0; i < n; ++i) order[cursor[assignment[i]]++] = i;
 
-  // ── Quantize centroids ────────────────────────────────────────────────────
   std::vector<int16_t> qcentroids(size_t(k) * IVF_DIMS);
   for (uint32_t c = 0; c < k; ++c)
     for (int d = 0; d < IVF_DIMS; ++d)
       qcentroids[size_t(c) * IVF_DIMS + d] =
           static_cast<int16_t>(std::llround(centroids[c][d]));
 
-  // ── Pack blocks + bounding boxes ─────────────────────────────────────────
   std::vector<int16_t> bbox_min(size_t(k) * IVF_DIMS,
                                 std::numeric_limits<int16_t>::max());
   std::vector<int16_t> bbox_max(size_t(k) * IVF_DIMS,
@@ -286,7 +234,6 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // ── Write index ───────────────────────────────────────────────────────────
   IndexHeader hdr{};
   hdr.magic = IVF_MAGIC;
   hdr.version = IVF_VERSION;
@@ -301,7 +248,7 @@ int main(int argc, char* argv[]) {
   std::ofstream out(output, std::ios::binary | std::ios::trunc);
   if (!out) {
     std::cerr << "Cannot write " << output << "\n";
-    return 1;
+    return false;
   }
   out.seekp((std::streamoff)(layout.total - 1));
   out.put('\0');
@@ -325,5 +272,86 @@ int main(int argc, char* argv[]) {
 
   std::cerr << "Written " << output << " (" << (layout.total / (1024 * 1024))
             << " MB)\n";
+  return true;
+}
+
+// ── main
+// ──────────────────────────────────────────────────────────────────────
+
+int main(int argc, char* argv[]) {
+  if (argc < 3) {
+    std::cerr << "Usage: " << argv[0] << " <input.json> <output.bin>"
+              << " [k=" << DEFAULT_K << "]"
+              << " [sample=" << DEFAULT_SAMPLE << "]"
+              << " [iters=" << DEFAULT_ITERS << "]"
+              << " [ec_output.bin] [ec_k=256]\n";
+    return 1;
+  }
+  const char* input = argv[1];
+  const char* output = argv[2];
+  uint32_t k = argc > 3 ? (uint32_t)std::stoul(argv[3]) : DEFAULT_K;
+  uint32_t sample_sz =
+      argc > 4 ? (uint32_t)std::stoul(argv[4]) : DEFAULT_SAMPLE;
+  int iters = argc > 5 ? std::stoi(argv[5]) : DEFAULT_ITERS;
+  const char* ec_output = argc > 6 ? argv[6] : nullptr;
+  uint32_t ec_k = argc > 7 ? (uint32_t)std::stoul(argv[7]) : 256;
+
+  // ── Parse references ──────────────────────────────────────────────────────
+  std::cerr << "Parsing " << input << "...\n";
+  ondemand::parser parser;
+  padded_string json;
+  if (padded_string::load(input).get(json)) {
+    std::cerr << "load failed\n";
+    return 1;
+  }
+  ondemand::document doc;
+  if (parser.iterate(json).get(doc)) {
+    std::cerr << "parse failed\n";
+    return 1;
+  }
+
+  std::vector<int16_t> vecs;
+  std::vector<uint8_t> labels;
+  vecs.reserve(size_t(3'000'000) * IVF_DIMS);
+  labels.reserve(3'000'000);
+
+  for (ondemand::object obj : doc.get_array()) {
+    int i = 0;
+    for (double v : obj["vector"].get_array()) {
+      if (i < IVF_DIMS) vecs.push_back(quantize(v));
+      ++i;
+    }
+    std::string_view label;
+    if (obj["label"].get_string().get(label)) {
+      vecs.resize(vecs.size() - IVF_DIMS);
+      continue;
+    }
+    labels.push_back(label == "fraud" ? 1u : 0u);
+  }
+  const uint32_t n = (uint32_t)labels.size();
+  std::cerr << "Loaded " << n << " records\n";
+
+  // ── Build main index ──────────────────────────────────────────────────────
+  if (!build_ivf(vecs, labels, k, sample_sz, iters, output)) return 1;
+
+  // ── Build edge-case index (unknown merchant + high mcc_risk) ─────────────
+  if (ec_output) {
+    std::cerr << "Filtering edge cases (vec[11]==10000 && vec[12]>=7500)...\n";
+    std::vector<int16_t> ec_vecs;
+    std::vector<uint8_t> ec_labels;
+    ec_vecs.reserve(size_t(1'000'000) * IVF_DIMS);
+    ec_labels.reserve(1'000'000);
+    for (uint32_t i = 0; i < n; ++i) {
+      const int16_t* v = vecs.data() + size_t(i) * IVF_DIMS;
+      if (v[11] == 10000 && v[12] >= 7500) {
+        ec_vecs.insert(ec_vecs.end(), v, v + IVF_DIMS);
+        ec_labels.push_back(labels[i]);
+      }
+    }
+    std::cerr << "Edge cases: " << ec_labels.size() << "\n";
+    if (!build_ivf(ec_vecs, ec_labels, ec_k, sample_sz, iters, ec_output))
+      return 1;
+  }
+
   return 0;
 }

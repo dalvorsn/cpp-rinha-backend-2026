@@ -75,6 +75,10 @@ public:
         if (++window_reqs_ >= FLUSH_EVERY) log_flush();
     }
 
+    void recordRepair() {
+        ++repair_reqs_;
+    }
+
     void scrape(char* out, int& len) {
         std::lock_guard<std::mutex> lg(mutex_);
         refresh_buf();
@@ -104,6 +108,7 @@ private:
     uint64_t window_start_ns_ = 0;
     uint32_t window_reqs_ = 0;
     uint64_t total_reqs_ = 0;
+    uint64_t repair_reqs_ = 0;
     char buf_[262144];
     int buf_len_ = 0;
     std::mutex mutex_;
@@ -231,6 +236,9 @@ private:
         W("# HELP rinha_requests_total Total processed requests\n"
           "# TYPE rinha_requests_total counter\n"
           "rinha_requests_total %lu\n", (unsigned long)total_reqs_);
+        W("# HELP rinha_repair_total Requests that triggered IVF repair\n"
+          "# TYPE rinha_repair_total counter\n"
+          "rinha_repair_total %lu\n", (unsigned long)repair_reqs_);
         for (int i = 0; i < gauge_count_; i++) {
             auto& g = gauges_[i];
             W("# HELP %s %s\n# TYPE %s gauge\n%s %ld\n",

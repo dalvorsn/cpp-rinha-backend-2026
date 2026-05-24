@@ -11,8 +11,8 @@ x-api: &api-common
   deploy:
     resources:
       limits:
-        cpus: '0.40'
-        memory: 160M
+        cpus: '0.45'
+        memory: 120M
 
 x-api-env: &api-env
   API_REFERENCES: resources/references.bin
@@ -59,7 +59,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.20'
+          cpus: '0.10'
           memory: 30M
 
 volumes:

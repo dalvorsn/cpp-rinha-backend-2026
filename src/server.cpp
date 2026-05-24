@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <sys/ioctl.h>
+
 #include "apm.hpp"
 #include "ivf.hpp"
 #include "normalizer.hpp"
@@ -80,6 +82,19 @@ static IVF* ivf = nullptr;
 static Normalizer normalizer;
 static int g_repair_min = 2;
 static int g_repair_max = 3;
+static int g_epoll_timeout_ms = 1;
+
+// epoll busy-poll params (Linux 6.0+, EPIOCSPARAMS ioctl)
+#ifndef EPIOCSPARAMS
+struct epoll_params {
+  uint32_t busy_poll_usecs;
+  uint16_t busy_poll_budget;
+  uint8_t  prefer_busy_poll;
+  uint8_t  __pad;
+};
+#define EPIOCSPARAMS _IOW('p', 0x01, struct epoll_params)
+#endif
+static struct epoll_params g_epoll_params = {};
 static int epfd = -1;
 static int ctrl_listen_fd = -1;
 #ifdef ENABLE_APM
@@ -512,22 +527,31 @@ int main(int argc, char* argv[]) {
   const char* norm_path   = getenv("API_NORMALIZATION");
   const char* mcc_path    = getenv("API_MCC_RISK");
   const char* mport_str   = getenv("API_METRICS_PORT");
-  const char* nprobe_str  = getenv("API_NPROBE");
-  const char* rmin_str    = getenv("API_REPAIR_MIN");
-  const char* rmax_str    = getenv("API_REPAIR_MAX");
+  const char* nprobe_str      = getenv("API_NPROBE");
+  const char* rmin_str        = getenv("API_REPAIR_MIN");
+  const char* rmax_str        = getenv("API_REPAIR_MAX");
+  const char* busy_poll_str   = getenv("API_BUSY_POLL_US");
+  const char* busy_budget_str = getenv("API_BUSY_POLL_BUDGET");
+  const char* prefer_bp_str   = getenv("API_PREFER_BUSY_POLL");
+  const char* epoll_to_str    = getenv("API_EPOLL_TIMEOUT_MS");
 
   if (!ctrl_path || !refs_path || !norm_path || !mcc_path) {
     fprintf(stderr,
             "Required env vars: API_CTRL API_REFERENCES "
             "API_NORMALIZATION API_MCC_RISK\n"
-            "Optional: API_METRICS_PORT API_NPROBE API_REPAIR_MIN "
-            "API_REPAIR_MAX\n");
+            "Optional: API_METRICS_PORT API_NPROBE API_REPAIR_MIN API_REPAIR_MAX\n"
+            "         API_BUSY_POLL_US API_BUSY_POLL_BUDGET\n"
+            "         API_PREFER_BUSY_POLL API_EPOLL_TIMEOUT_MS\n");
     return 1;
   }
 
   int g_nprobe = nprobe_str ? atoi(nprobe_str) : 4;
-  if (rmin_str) g_repair_min = atoi(rmin_str);
-  if (rmax_str) g_repair_max = atoi(rmax_str);
+  if (rmin_str)        g_repair_min                    = atoi(rmin_str);
+  if (rmax_str)        g_repair_max                    = atoi(rmax_str);
+  if (busy_poll_str)   g_epoll_params.busy_poll_usecs  = (uint32_t)atoi(busy_poll_str);
+  if (busy_budget_str) g_epoll_params.busy_poll_budget = (uint16_t)atoi(busy_budget_str);
+  if (prefer_bp_str)   g_epoll_params.prefer_busy_poll = (uint8_t)atoi(prefer_bp_str);
+  if (epoll_to_str)    g_epoll_timeout_ms              = atoi(epoll_to_str);
 
   for (int i = 0; i < 6; i++) {
     full_resp_len[i] = snprintf(full_resp[i], sizeof(full_resp[i]),
@@ -602,6 +626,14 @@ int main(int argc, char* argv[]) {
 #endif
 
   epfd = epoll_create1(0);
+  if (g_epoll_params.busy_poll_usecs || g_epoll_params.prefer_busy_poll) {
+    if (ioctl(epfd, EPIOCSPARAMS, &g_epoll_params) < 0)
+      fprintf(stderr, "[WARN] EPIOCSPARAMS: %s\n", strerror(errno));
+    else
+      fprintf(stderr, "[INFO] epoll busy_poll=%uus budget=%u prefer=%u\n",
+              g_epoll_params.busy_poll_usecs, g_epoll_params.busy_poll_budget,
+              g_epoll_params.prefer_busy_poll);
+  }
   struct epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.fd = ctrl_listen_fd;
@@ -619,7 +651,7 @@ int main(int argc, char* argv[]) {
 
   struct epoll_event events[MAX_EVTS];
   while (true) {
-    int nfds = epoll_wait(epfd, events, MAX_EVTS, 1);
+    int nfds = epoll_wait(epfd, events, MAX_EVTS, g_epoll_timeout_ms);
     if (nfds < 0) {
       if (errno == EINTR) continue;
       perror("epoll_wait");

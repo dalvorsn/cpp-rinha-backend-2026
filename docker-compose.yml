@@ -21,6 +21,10 @@ x-api-env: &api-env
   API_REPAIR_MIN: "1"
   API_REPAIR_MAX: "4"
   API_NPROBE: "12"
+  API_BUSY_POLL_US: "50"
+  API_BUSY_POLL_BUDGET: "8"
+  API_PREFER_BUSY_POLL: "1"
+  API_EPOLL_TIMEOUT_MS: "1"
 
 services:
   api1:

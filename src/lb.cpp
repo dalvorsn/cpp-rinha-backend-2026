@@ -21,6 +21,10 @@
 
 #include <atomic>
 
+#include "apm.hpp"
+
+APM apm;
+
 #define MAX_BACKENDS 8
 #define MAX_FDS 65536
 #define BACKLOG 65535
@@ -43,15 +47,9 @@ static int upstream_count = 0;
 static int lb_port = 9999;
 static uint32_t rr_next = 0;
 
-static double cgroup_cpu_limit_cores = -1.0;
 #ifdef ENABLE_APM
 static std::atomic<unsigned long> total_conns[MAX_BACKENDS];
 static std::atomic<unsigned long> connect_errors[MAX_BACKENDS];
-
-// Metrics (background thread)
-static int metrics_srv_fd = -1;
-static int metrics_epfd = -1;
-static bool is_metrics_conn[MAX_FDS];
 #endif
 
 // ---------------------------------------------------------------------------
@@ -141,8 +139,11 @@ static int send_fd_once(upstream_t* u, int client_fd) {
   for (;;) {
     ssize_t n = sendmsg(u->fd, &u->msg, MSG_NOSIGNAL | MSG_DONTWAIT);
     if (n == 1) return 0;
-    if (n < 0 && errno == EINTR) continue;
-    return errno ? errno : EIO;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return errno;
+    }
+    return EIO;
   }
 }
 
@@ -196,128 +197,6 @@ static int make_listen_socket(int port) {
 }
 
 // ---------------------------------------------------------------------------
-// Metrics endpoint (background thread)
-// ---------------------------------------------------------------------------
-#ifdef ENABLE_APM
-static void handle_metrics_accept() {
-  for (;;) {
-    int cfd = accept4(metrics_srv_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (cfd < 0) return;
-    if (cfd >= MAX_FDS) {
-      close(cfd);
-      continue;
-    }
-    is_metrics_conn[cfd] = true;
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLRDHUP;
-    ev.data.fd = cfd;
-    epoll_ctl(metrics_epfd, EPOLL_CTL_ADD, cfd, &ev);
-  }
-}
-
-static void handle_metrics_conn(int fd) {
-  char req[256];
-  recv(fd, req, sizeof(req), 0);
-
-  static char body[4096];
-  int n = 0;
-  const int cap = (int)sizeof(body);
-#define W(...) \
-  if (n < cap) n += snprintf(body + n, (size_t)(cap - n), __VA_ARGS__)
-
-  W("# HELP rinha_lb_connections_accepted_total Connections routed per "
-    "backend\n"
-    "# TYPE rinha_lb_connections_accepted_total counter\n");
-  for (int i = 0; i < upstream_count; i++)
-    W("rinha_lb_connections_accepted_total{backend=\"%d\"} %lu\n", i,
-      total_conns[i].load(std::memory_order_relaxed));
-
-  W("# HELP rinha_lb_connect_errors_total Failed send_fd calls\n"
-    "# TYPE rinha_lb_connect_errors_total counter\n");
-  for (int i = 0; i < upstream_count; i++)
-    W("rinha_lb_connect_errors_total{backend=\"%d\"} %lu\n", i,
-      connect_errors[i].load(std::memory_order_relaxed));
-
-  // cgroup cpu.stat
-  {
-    FILE* f = fopen("/sys/fs/cgroup/cpu.stat", "r");
-    if (f) {
-      uint64_t usage_usec = 0, user_usec = 0, system_usec = 0,
-               throttled_usec = 0;
-      char key[64];
-      uint64_t val;
-      while (fscanf(f, "%63s %lu", key, &val) == 2) {
-        if (!strcmp(key, "usage_usec"))
-          usage_usec = val;
-        else if (!strcmp(key, "user_usec"))
-          user_usec = val;
-        else if (!strcmp(key, "system_usec"))
-          system_usec = val;
-        else if (!strcmp(key, "throttled_usec"))
-          throttled_usec = val;
-      }
-      fclose(f);
-      W("# HELP rinha_lb_cgroup_cpu_usage_seconds_total LB cgroup CPU usage\n"
-        "# TYPE rinha_lb_cgroup_cpu_usage_seconds_total counter\n"
-        "rinha_lb_cgroup_cpu_usage_seconds_total{mode=\"user\"} %.6f\n"
-        "rinha_lb_cgroup_cpu_usage_seconds_total{mode=\"system\"} %.6f\n"
-        "rinha_lb_cgroup_cpu_usage_seconds_total{mode=\"total\"} %.6f\n",
-        user_usec / 1e6, system_usec / 1e6, usage_usec / 1e6);
-      W("# HELP rinha_lb_cgroup_cpu_throttled_seconds_total LB cgroup "
-        "throttle\n"
-        "# TYPE rinha_lb_cgroup_cpu_throttled_seconds_total counter\n"
-        "rinha_lb_cgroup_cpu_throttled_seconds_total %.6f\n",
-        throttled_usec / 1e6);
-    }
-  }
-  if (cgroup_cpu_limit_cores > 0)
-    W("# HELP rinha_lb_cgroup_cpu_limit_cores LB CPU limit\n"
-      "# TYPE rinha_lb_cgroup_cpu_limit_cores gauge\n"
-      "rinha_lb_cgroup_cpu_limit_cores %.6f\n",
-      cgroup_cpu_limit_cores);
-#undef W
-
-  char hdr[128];
-  int hlen = snprintf(hdr, sizeof(hdr),
-                      "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
-                      "Content-Length: %d\r\n\r\n",
-                      n);
-  send(fd, hdr, hlen, MSG_NOSIGNAL);
-  send(fd, body, n, MSG_NOSIGNAL);
-  epoll_ctl(metrics_epfd, EPOLL_CTL_DEL, fd, NULL);
-  is_metrics_conn[fd] = false;
-  close(fd);
-}
-
-static void* metrics_thread_main(void*) {
-  struct epoll_event events[64];
-  for (;;) {
-    int n = epoll_wait(metrics_epfd, events, 64, -1);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    for (int i = 0; i < n; i++) {
-      int fd = events[i].data.fd;
-      uint32_t e = events[i].events;
-      if (fd == metrics_srv_fd) {
-        handle_metrics_accept();
-      } else if (fd >= 0 && fd < MAX_FDS && is_metrics_conn[fd]) {
-        if (e & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-          epoll_ctl(metrics_epfd, EPOLL_CTL_DEL, fd, NULL);
-          is_metrics_conn[fd] = false;
-          close(fd);
-        } else if (e & EPOLLIN) {
-          handle_metrics_conn(fd);
-        }
-      }
-    }
-  }
-  return NULL;
-}
-#endif  // ENABLE_APM
-
-// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main(void) {
@@ -347,23 +226,6 @@ int main(void) {
   }
   if (upstream_count == 0) return 1;
 
-  // cgroup CPU limit
-  {
-    FILE* f = fopen("/sys/fs/cgroup/cpu.max", "r");
-    if (f) {
-      char quota_str[32];
-      unsigned long period = 100000;
-      if (fscanf(f, "%31s %lu", quota_str, &period) == 2 &&
-          strcmp(quota_str, "max") != 0) {
-        unsigned long quota = strtoul(quota_str, NULL, 10);
-        cgroup_cpu_limit_cores = (double)quota / (double)period;
-        fprintf(stderr, "[INFO/LB] cgroup CPU limit: %.3f cores\n",
-                cgroup_cpu_limit_cores);
-      }
-      fclose(f);
-    }
-  }
-
   // Connect to all backends (blocking until ready)
   for (int i = 0; i < upstream_count; i++) {
     upstreams[i].fd = connect_ctrl_wait(upstreams[i].path);
@@ -380,36 +242,11 @@ int main(void) {
   fprintf(stderr, "[INFO/LB] listening on port %d\n", lb_port);
 
 #ifdef ENABLE_APM
-  // Metrics (optional background thread)
-  const char* mport_env = getenv("LB_METRICS_PORT");
-  if (mport_env) {
-    int mport = atoi(mport_env);
-    metrics_srv_fd =
-        socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    int opt = 1;
-    setsockopt(metrics_srv_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in maddr = {};
-    maddr.sin_family = AF_INET;
-    maddr.sin_addr.s_addr = INADDR_ANY;
-    maddr.sin_port = htons((uint16_t)mport);
-    if (bind(metrics_srv_fd, (struct sockaddr*)&maddr, sizeof(maddr)) < 0) {
-      perror("metrics bind");
-      close(metrics_srv_fd);
-      metrics_srv_fd = -1;
-    } else {
-      listen(metrics_srv_fd, 8);
-      metrics_epfd = epoll_create1(0);
-      struct epoll_event ev;
-      ev.events = EPOLLIN;
-      ev.data.fd = metrics_srv_fd;
-      epoll_ctl(metrics_epfd, EPOLL_CTL_ADD, metrics_srv_fd, &ev);
-      pthread_t tid;
-      pthread_attr_t attr;
-      pthread_attr_init(&attr);
-      pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-      pthread_create(&tid, &attr, metrics_thread_main, NULL);
-      pthread_attr_destroy(&attr);
-      fprintf(stderr, "[INFO/LB] metrics on :%d\n", mport);
+  {
+    const char* mport_env = getenv("LB_METRICS_PORT");
+    if (mport_env) {
+      apm.register_lb_metrics(upstream_count, total_conns, connect_errors);
+      apm.start_metrics_server(atoi(mport_env));
     }
   }
 #endif
@@ -440,6 +277,8 @@ int main(void) {
       total_conns[first].fetch_add(1, std::memory_order_relaxed);
     else
       connect_errors[first].fetch_add(1, std::memory_order_relaxed);
+#else
+    (void)e;
 #endif
 
     close(cfd);

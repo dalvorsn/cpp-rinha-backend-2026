@@ -10,20 +10,21 @@
 
 #include "types.hpp"
 
-static constexpr uint32_t DEFAULT_K      = 4096;
+static constexpr uint32_t DEFAULT_K = 4096;
 static constexpr uint32_t DEFAULT_SAMPLE = 50000;
-static constexpr int      DEFAULT_ITERS  = 50;
+static constexpr int DEFAULT_ITERS = 50;
 
 static inline int16_t quantize(double v) {
   if (v < -1.0) v = -1.0;
-  if (v > 1.0)  v = 1.0;
+  if (v > 1.0) v = 1.0;
   return static_cast<int16_t>(std::llround(v * 10000.0));
 }
 
-// ── Distance helpers ──────────────────────────────────────────────────────────
+// ── Distance helpers
+// ──────────────────────────────────────────────────────────
 
 static float dist_to_centroid(const int16_t *p,
-                               const std::array<float, IVF_DIMS> &c) {
+                              const std::array<float, IVF_DIMS> &c) {
   float s = 0;
   for (int d = 0; d < IVF_DIMS; ++d) {
     float diff = float(p[d]) - c[d];
@@ -36,15 +37,19 @@ static uint32_t nearest_centroid(
     const int16_t *p,
     const std::vector<std::array<float, IVF_DIMS>> &centroids) {
   uint32_t best = 0;
-  float best_d  = dist_to_centroid(p, centroids[0]);
+  float best_d = dist_to_centroid(p, centroids[0]);
   for (uint32_t c = 1; c < (uint32_t)centroids.size(); ++c) {
     float d = dist_to_centroid(p, centroids[c]);
-    if (d < best_d) { best_d = d; best = c; }
+    if (d < best_d) {
+      best_d = d;
+      best = c;
+    }
   }
   return best;
 }
 
-// ── K-means++ init ────────────────────────────────────────────────────────────
+// ── K-means++ init
+// ────────────────────────────────────────────────────────────
 
 static std::vector<std::array<float, IVF_DIMS>> init_kmeans_pp(
     const std::vector<int16_t> &vecs, const std::vector<uint32_t> &sample,
@@ -78,7 +83,10 @@ static std::vector<std::array<float, IVF_DIMS>> init_kmeans_pp(
     size_t chosen = sample.size() - 1;
     for (size_t i = 0; i < sample.size(); ++i) {
       acc += dmin[i];
-      if (acc >= target) { chosen = i; break; }
+      if (acc >= target) {
+        chosen = i;
+        break;
+      }
     }
     const int16_t *pp = vecs.data() + size_t(sample[chosen]) * IVF_DIMS;
     for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(pp[d]);
@@ -87,7 +95,8 @@ static std::vector<std::array<float, IVF_DIMS>> init_kmeans_pp(
   return centroids;
 }
 
-// ── K-means training ──────────────────────────────────────────────────────────
+// ── K-means training
+// ──────────────────────────────────────────────────────────
 
 static void train_kmeans(const std::vector<int16_t> &vecs,
                          const std::vector<uint32_t> &sample,
@@ -100,15 +109,18 @@ static void train_kmeans(const std::vector<int16_t> &vecs,
   for (int iter = 0; iter < iters; ++iter) {
     uint64_t changed = 0;
     for (size_t i = 0; i < sample.size(); ++i) {
-      uint32_t c = nearest_centroid(
-          vecs.data() + size_t(sample[i]) * IVF_DIMS, centroids);
-      if (c != assign[i]) { ++changed; assign[i] = c; }
+      uint32_t c = nearest_centroid(vecs.data() + size_t(sample[i]) * IVF_DIMS,
+                                    centroids);
+      if (c != assign[i]) {
+        ++changed;
+        assign[i] = c;
+      }
     }
 
     std::vector<double> sums(size_t(k) * IVF_DIMS, 0.0);
     std::vector<uint32_t> counts(k, 0);
     for (size_t i = 0; i < sample.size(); ++i) {
-      uint32_t c    = assign[i];
+      uint32_t c = assign[i];
       const int16_t *p = vecs.data() + size_t(sample[i]) * IVF_DIMS;
       ++counts[c];
       double *row = sums.data() + size_t(c) * IVF_DIMS;
@@ -121,9 +133,10 @@ static void train_kmeans(const std::vector<int16_t> &vecs,
         const int16_t *p = vecs.data() + size_t(sample[pick(rng)]) * IVF_DIMS;
         for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(p[d]);
       } else {
-        double inv  = 1.0 / counts[c];
+        double inv = 1.0 / counts[c];
         double *row = sums.data() + size_t(c) * IVF_DIMS;
-        for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(row[d] * inv);
+        for (int d = 0; d < IVF_DIMS; ++d)
+          centroids[c][d] = float(row[d] * inv);
       }
     }
     std::cerr << "  iter " << (iter + 1) << "/" << iters
@@ -132,7 +145,8 @@ static void train_kmeans(const std::vector<int16_t> &vecs,
   }
 }
 
-// ── IVF build helper ──────────────────────────────────────────────────────────
+// ── IVF build helper
+// ──────────────────────────────────────────────────────────
 
 static bool build_ivf(const std::vector<int16_t> &vecs,
                       const std::vector<uint8_t> &labels, uint32_t k,
@@ -175,17 +189,15 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
   std::vector<uint32_t> order(n);
   for (uint32_t i = 0; i < n; ++i) order[cursor[assignment[i]]++] = i;
 
-  // Sort vectors within each cluster by ascending distance to centroid.
-  // Nearest-first ordering causes max_top to tighten faster during scan_cluster,
-  // improving the effectiveness of the partial-distance pruning at 6 and 10 dims.
   for (uint32_t c = 0; c < k; ++c) {
     if (counts[c] < 2) continue;
-    const auto& cent = centroids[c];
-    std::sort(order.begin() + starts[c], order.begin() + starts[c] + counts[c],
-              [&](uint32_t a, uint32_t b) {
-                return dist_to_centroid(vecs.data() + size_t(a) * IVF_DIMS, cent)
-                     < dist_to_centroid(vecs.data() + size_t(b) * IVF_DIMS, cent);
-              });
+    const auto &cent = centroids[c];
+    std::sort(
+        order.begin() + starts[c], order.begin() + starts[c] + counts[c],
+        [&](uint32_t a, uint32_t b) {
+          return dist_to_centroid(vecs.data() + size_t(a) * IVF_DIMS, cent) <
+                 dist_to_centroid(vecs.data() + size_t(b) * IVF_DIMS, cent);
+        });
   }
 
   std::vector<int16_t> qcentroids(size_t(k) * IVF_DIMS);
@@ -199,8 +211,8 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
   std::vector<int16_t> bbox_max(size_t(k) * IVF_DIMS,
                                 std::numeric_limits<int16_t>::min());
   std::vector<uint8_t> out_labels(size_t(total_blocks) * IVF_BLOCK, 0);
-  std::vector<int16_t> blocks_data(
-      size_t(total_blocks) * IVF_DIMS * IVF_BLOCK, 0);
+  std::vector<int16_t> blocks_data(size_t(total_blocks) * IVF_DIMS * IVF_BLOCK,
+                                   0);
 
   for (uint32_t c = 0; c < k; ++c) {
     if (counts[c] == 0) {
@@ -211,17 +223,16 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
       continue;
     }
     for (uint32_t pos = 0; pos < counts[c]; ++pos) {
-      const uint32_t orig  = order[starts[c] + pos];
+      const uint32_t orig = order[starts[c] + pos];
       const uint32_t block = block_offsets[c] + pos / IVF_BLOCK;
-      const uint32_t lane  = pos % IVF_BLOCK;
+      const uint32_t lane = pos % IVF_BLOCK;
 
       out_labels[size_t(block) * IVF_BLOCK + lane] = labels[orig];
 
       const int16_t *src = vecs.data() + size_t(orig) * IVF_DIMS;
-      int16_t *dst =
-          blocks_data.data() + size_t(block) * IVF_DIMS * IVF_BLOCK;
+      int16_t *dst = blocks_data.data() + size_t(block) * IVF_DIMS * IVF_BLOCK;
       for (int d = 0; d < IVF_DIMS; ++d) {
-        int16_t v  = src[d];
+        int16_t v = src[d];
         dst[block_pair_offset(d, (int)lane)] = v;
         int16_t &mn = bbox_min[size_t(c) * IVF_DIMS + d];
         int16_t &mx = bbox_max[size_t(c) * IVF_DIMS + d];
@@ -232,18 +243,21 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
   }
 
   IndexHeader hdr{};
-  hdr.magic        = IVF_MAGIC;
-  hdr.version      = IVF_VERSION;
-  hdr.n            = n;
-  hdr.k            = k;
+  hdr.magic = IVF_MAGIC;
+  hdr.version = IVF_VERSION;
+  hdr.n = n;
+  hdr.k = k;
   hdr.total_blocks = total_blocks;
-  hdr.block_size   = IVF_BLOCK;
-  hdr.dims         = IVF_DIMS;
+  hdr.block_size = IVF_BLOCK;
+  hdr.dims = IVF_DIMS;
 
   const IndexLayout layout = layout_for(k, total_blocks);
 
   std::ofstream out(output, std::ios::binary | std::ios::trunc);
-  if (!out) { std::cerr << "Cannot write " << output << "\n"; return false; }
+  if (!out) {
+    std::cerr << "Cannot write " << output << "\n";
+    return false;
+  }
   out.seekp((std::streamoff)(layout.total - 1));
   out.put('\0');
 
@@ -252,64 +266,82 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
     out.write(static_cast<const char *>(data), (std::streamsize)len);
   };
 
-  write_at(0,               &hdr,            sizeof(hdr));
-  write_at(layout.centroids, qcentroids.data(), qcentroids.size() * sizeof(int16_t));
-  write_at(layout.bbox_min,  bbox_min.data(),   bbox_min.size()   * sizeof(int16_t));
-  write_at(layout.bbox_max,  bbox_max.data(),   bbox_max.size()   * sizeof(int16_t));
-  write_at(layout.offsets,   block_offsets.data(), block_offsets.size() * sizeof(uint32_t));
-  write_at(layout.counts,    counts.data(),     counts.size()     * sizeof(uint32_t));
-  write_at(layout.labels,    out_labels.data(), out_labels.size());
-  write_at(layout.blocks,    blocks_data.data(), blocks_data.size() * sizeof(int16_t));
+  write_at(0, &hdr, sizeof(hdr));
+  write_at(layout.centroids, qcentroids.data(),
+           qcentroids.size() * sizeof(int16_t));
+  write_at(layout.bbox_min, bbox_min.data(), bbox_min.size() * sizeof(int16_t));
+  write_at(layout.bbox_max, bbox_max.data(), bbox_max.size() * sizeof(int16_t));
+  write_at(layout.offsets, block_offsets.data(),
+           block_offsets.size() * sizeof(uint32_t));
+  write_at(layout.counts, counts.data(), counts.size() * sizeof(uint32_t));
+  write_at(layout.labels, out_labels.data(), out_labels.size());
+  write_at(layout.blocks, blocks_data.data(),
+           blocks_data.size() * sizeof(int16_t));
 
   std::cerr << "Written " << output << " (" << (layout.total / (1024 * 1024))
             << " MB)\n";
   return true;
 }
 
-// ── Streaming JSON parser ─────────────────────────────────────────────────────
-// Reads [{...}, ...] where each object has "vector":[14 doubles] and "label":"...".
-// Avoids loading the whole file into a jsmn token tree.
+// ── Streaming JSON parser
+// ───────────────────────────────────────────────────── Reads [{...}, ...]
+// where each object has "vector":[14 doubles] and "label":"...". Avoids loading
+// the whole file into a jsmn token tree.
 
 static bool parse_references(const char *input, std::vector<int16_t> &vecs,
-                               std::vector<uint8_t> &labels) {
+                             std::vector<uint8_t> &labels) {
   FILE *f = fopen(input, "rb");
-  if (!f) { std::cerr << "Cannot open " << input << "\n"; return false; }
+  if (!f) {
+    std::cerr << "Cannot open " << input << "\n";
+    return false;
+  }
   fseek(f, 0, SEEK_END);
   long sz = ftell(f);
+  if (sz <= 0) {
+    fclose(f);
+    return false;
+  }
   rewind(f);
-  if (sz <= 0) { fclose(f); return false; }
 
   std::vector<char> buf((size_t)sz + 1, '\0');
   fread(buf.data(), 1, (size_t)sz, f);
   fclose(f);
 
-  const char *p   = buf.data();
+  const char *p = buf.data();
   const char *end = p + sz;
 
   while (p < end) {
     // Advance to next object
     while (p < end && *p != '{' && *p != ']') p++;
     if (p >= end || *p == ']') break;
-    const char *obj_start = ++p; // just past '{'
+    const char *obj_start = ++p;  // just past '{'
 
     // Objects are flat (vector array contains only numbers); find closing '}'
     // by counting brace depth.
     int depth = 1;
     const char *obj_end = obj_start;
     while (obj_end < end && depth > 0) {
-      if (*obj_end == '{') depth++;
-      else if (*obj_end == '}') depth--;
+      if (*obj_end == '{')
+        depth++;
+      else if (*obj_end == '}')
+        depth--;
       obj_end++;
     }
     if (depth != 0) break;
-    obj_end--; // points at '}'
+    obj_end--;  // points at '}'
 
     // ── parse "vector" ────────────────────────────────────────────────────
-    const char *vk = (const char *)memmem(obj_start, obj_end - obj_start,
-                                           "\"vector\"", 8);
-    if (!vk) { p = obj_end + 1; continue; }
+    const char *vk =
+        (const char *)memmem(obj_start, obj_end - obj_start, "\"vector\"", 8);
+    if (!vk) {
+      p = obj_end + 1;
+      continue;
+    }
     const char *arr = (const char *)memchr(vk + 8, '[', obj_end - vk - 8);
-    if (!arr) { p = obj_end + 1; continue; }
+    if (!arr) {
+      p = obj_end + 1;
+      continue;
+    }
     arr++;
 
     int n_read = 0;
@@ -333,8 +365,8 @@ static bool parse_references(const char *input, std::vector<int16_t> &vecs,
     }
 
     // ── parse "label" ─────────────────────────────────────────────────────
-    const char *lk = (const char *)memmem(obj_start, obj_end - obj_start,
-                                           "\"label\"", 7);
+    const char *lk =
+        (const char *)memmem(obj_start, obj_end - obj_start, "\"label\"", 7);
     if (!lk) {
       vecs.resize(vecs.size() - IVF_DIMS);
       p = obj_end + 1;
@@ -346,7 +378,8 @@ static bool parse_references(const char *input, std::vector<int16_t> &vecs,
       p = obj_end + 1;
       continue;
     }
-    const char *qopen = (const char *)memchr(colon + 1, '"', obj_end - colon - 1);
+    const char *qopen =
+        (const char *)memchr(colon + 1, '"', obj_end - colon - 1);
     if (!qopen) {
       vecs.resize(vecs.size() - IVF_DIMS);
       p = obj_end + 1;
@@ -361,7 +394,8 @@ static bool parse_references(const char *input, std::vector<int16_t> &vecs,
   return true;
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
+// ── main
+// ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char *argv[]) {
   if (argc < 3) {
@@ -372,13 +406,14 @@ int main(int argc, char *argv[]) {
               << " [ec_output.bin] [ec_k=256]\n";
     return 1;
   }
-  const char *input   = argv[1];
-  const char *output  = argv[2];
-  uint32_t k          = argc > 3 ? (uint32_t)std::stoul(argv[3]) : DEFAULT_K;
-  uint32_t sample_sz  = argc > 4 ? (uint32_t)std::stoul(argv[4]) : DEFAULT_SAMPLE;
-  int iters           = argc > 5 ? std::stoi(argv[5]) : DEFAULT_ITERS;
+  const char *input = argv[1];
+  const char *output = argv[2];
+  uint32_t k = argc > 3 ? (uint32_t)std::stoul(argv[3]) : DEFAULT_K;
+  uint32_t sample_sz =
+      argc > 4 ? (uint32_t)std::stoul(argv[4]) : DEFAULT_SAMPLE;
+  int iters = argc > 5 ? std::stoi(argv[5]) : DEFAULT_ITERS;
   const char *ec_output = argc > 6 ? argv[6] : nullptr;
-  uint32_t ec_k       = argc > 7 ? (uint32_t)std::stoul(argv[7]) : 256;
+  uint32_t ec_k = argc > 7 ? (uint32_t)std::stoul(argv[7]) : 256;
 
   std::cerr << "Parsing " << input << "...\n";
   std::vector<int16_t> vecs;

@@ -74,7 +74,8 @@ class IVF {
   static constexpr int MAX_NPROBE = 16;
 
   int get_fraud_count(const int16_t* q, bool* did_repair = nullptr) const {
-    // Compute vq pairs once — shared by find_top_centroids, scan_cluster, repair
+    // Compute vq pairs once — shared by find_top_centroids, scan_cluster,
+    // repair
     __m256i vq[IVF_PAIRS];
     for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
 
@@ -182,9 +183,9 @@ class IVF {
         for (int lane = 0; lane < 8; lane++) {
           const uint32_t c = g * 8 + (uint32_t)lane;
           if (c < k) {
-            dmin[lane * 2]     = bbox_min[size_t(c) * IVF_DIMS + p * 2];
+            dmin[lane * 2] = bbox_min[size_t(c) * IVF_DIMS + p * 2];
             dmin[lane * 2 + 1] = bbox_min[size_t(c) * IVF_DIMS + p * 2 + 1];
-            dmax[lane * 2]     = bbox_max[size_t(c) * IVF_DIMS + p * 2];
+            dmax[lane * 2] = bbox_max[size_t(c) * IVF_DIMS + p * 2];
             dmax[lane * 2 + 1] = bbox_max[size_t(c) * IVF_DIMS + p * 2 + 1];
           }
         }
@@ -194,7 +195,8 @@ class IVF {
 
   // Compute bbox lower bounds for 8 clusters in group g simultaneously.
   // vq must be precomputed via make_qpair for each pair.
-  // lbs[8] receives the 8 lower bounds (may include phantom clusters if k%8 != 0).
+  // lbs[8] receives the 8 lower bounds (may include phantom clusters if k%8 !=
+  // 0).
   __attribute__((always_inline)) inline void bbox_lower_bound_8(
       uint32_t g, const __m256i* vq, uint32_t* lbs) const {
     const int16_t* smin = bpsoa_min + size_t(g) * IVF_PAIRS * 16;
@@ -289,7 +291,8 @@ class IVF {
   }
     for (uint32_t bi = blk_start; bi < blk_end; bi++) {
       if (bi + 2 < blk_end)
-        __builtin_prefetch(blocks + size_t(bi + 2) * IVF_DIMS * IVF_BLOCK, 0, 1);
+        __builtin_prefetch(blocks + size_t(bi + 2) * IVF_DIMS * IVF_BLOCK, 0,
+                           1);
       const int16_t* blk = blocks + size_t(bi) * IVF_DIMS * IVF_BLOCK;
 
       // Capture max_top at block start — uses the tightest available value
@@ -329,11 +332,13 @@ class IVF {
 #undef SPAIR
   }
 
-
   void repair(const __m256i* vq, const uint32_t* skip, int nskip,
               uint32_t* top_dists, uint8_t* top_labels,
               uint32_t& max_top) const {
-    struct Cand { uint32_t lb; uint32_t c; };
+    struct Cand {
+      uint32_t lb;
+      uint32_t c;
+    };
     static thread_local Cand cands[1024];
     int ncands = 0;
 
@@ -352,10 +357,11 @@ class IVF {
       bbox_lower_bound_8(g, vq, lbs);
 
       // SIMD filter: which of the 8 clusters have lb < max_top?
-      // _mm256_cmpgt_epi32 sets lane to 0xFFFFFFFF if vmt > vlbs (i.e. lb < max_top)
+      // _mm256_cmpgt_epi32 sets lane to 0xFFFFFFFF if vmt > vlbs (i.e. lb <
+      // max_top)
       __m256i vlbs = _mm256_loadu_si256((const __m256i*)lbs);
-      int pass_mask =
-          _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(vmt, vlbs)));
+      int pass_mask = _mm256_movemask_ps(
+          _mm256_castsi256_ps(_mm256_cmpgt_epi32(vmt, vlbs)));
       if (!pass_mask) continue;
 
       const uint32_t base = g * 8;
@@ -378,8 +384,8 @@ class IVF {
       scan_cluster_vq(vq, cands[i].c, top_dists, top_labels, max_top);
       // Early stop: if result is now unambiguous, scanning more clusters
       // cannot change the approved/denied decision.
-      int cnt_now = top_labels[0] + top_labels[1] + top_labels[2]
-                  + top_labels[3] + top_labels[4];
+      int cnt_now = top_labels[0] + top_labels[1] + top_labels[2] +
+                    top_labels[3] + top_labels[4];
       if (cnt_now < repair_min_ || cnt_now > repair_max_) break;
     }
   }

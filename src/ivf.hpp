@@ -74,8 +74,12 @@ class IVF {
   static constexpr int MAX_NPROBE = 16;
 
   int get_fraud_count(const int16_t* q, bool* did_repair = nullptr) const {
+    // Compute vq pairs once — shared by find_top_centroids, scan_cluster, repair
+    __m256i vq[IVF_PAIRS];
+    for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
+
     uint32_t probes[MAX_NPROBE];
-    find_top_centroids(q, probes, nprobe_);
+    find_top_centroids_vq(vq, probes, nprobe_);
 
     uint32_t top_dists[5] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
                              UINT32_MAX};
@@ -83,13 +87,13 @@ class IVF {
     uint32_t max_top = UINT32_MAX;
 
     for (int i = 0; i < nprobe_; i++)
-      scan_cluster(probes[i], q, top_dists, top_labels, max_top);
+      scan_cluster_vq(vq, probes[i], top_dists, top_labels, max_top);
 
     int cnt = 0;
     for (int i = 0; i < 5; i++) cnt += top_labels[i];
 
     if (cnt >= repair_min_ && cnt <= repair_max_) {
-      repair(q, probes, nprobe_, top_dists, top_labels, max_top);
+      repair(vq, probes, nprobe_, top_dists, top_labels, max_top);
       cnt = 0;
       for (int i = 0; i < 5; i++) cnt += top_labels[i];
       if (did_repair) *did_repair = true;
@@ -210,10 +214,7 @@ class IVF {
   }
 
   // Fill `out[0..n-1]` with the n nearest centroid indices, sorted ascending.
-  void find_top_centroids(const int16_t* q, uint32_t* out, int n) const {
-    __m256i vq[IVF_PAIRS];
-    for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
-
+  void find_top_centroids_vq(const __m256i* vq, uint32_t* out, int n) const {
     uint32_t top_d[MAX_NPROBE];
     uint32_t top_c[MAX_NPROBE];
     for (int i = 0; i < n; i++) {
@@ -272,12 +273,9 @@ class IVF {
     max_top = top_dists[4];
   }
 
-  void scan_cluster(uint32_t c, const int16_t* q, uint32_t* top_dists,
-                    uint8_t* top_labels, uint32_t& max_top) const {
+  void scan_cluster_vq(const __m256i* vq, uint32_t c, uint32_t* top_dists,
+                       uint8_t* top_labels, uint32_t& max_top) const {
     if (counts[c] == 0) return;
-
-    __m256i vq[IVF_PAIRS];
-    for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
 
     const uint32_t blk_start = blk_offsets[c];
     const uint32_t blk_end = blk_offsets[c + 1];
@@ -332,7 +330,7 @@ class IVF {
   }
 
 
-  void repair(const int16_t* q, const uint32_t* skip, int nskip,
+  void repair(const __m256i* vq, const uint32_t* skip, int nskip,
               uint32_t* top_dists, uint8_t* top_labels,
               uint32_t& max_top) const {
     struct Cand { uint32_t lb; uint32_t c; };
@@ -343,10 +341,6 @@ class IVF {
     uint64_t skip_set[64] = {};
     for (int s = 0; s < nskip; s++)
       skip_set[skip[s] >> 6] |= 1ULL << (skip[s] & 63);
-
-    // Precompute query pairs once for all 8-cluster bbox groups
-    __m256i vq[IVF_PAIRS];
-    for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
 
     // Signed comparison: clip max_top to INT32_MAX to avoid sign issues
     const __m256i vmt =
@@ -381,7 +375,12 @@ class IVF {
               [](const Cand& a, const Cand& b) { return a.lb < b.lb; });
     for (int i = 0; i < ncands; i++) {
       if (cands[i].lb >= max_top) break;
-      scan_cluster(cands[i].c, q, top_dists, top_labels, max_top);
+      scan_cluster_vq(vq, cands[i].c, top_dists, top_labels, max_top);
+      // Early stop: if result is now unambiguous, scanning more clusters
+      // cannot change the approved/denied decision.
+      int cnt_now = top_labels[0] + top_labels[1] + top_labels[2]
+                  + top_labels[3] + top_labels[4];
+      if (cnt_now < repair_min_ || cnt_now > repair_max_) break;
     }
   }
 };

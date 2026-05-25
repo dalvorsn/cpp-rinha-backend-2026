@@ -1,6 +1,7 @@
 x-api: &api-common
   build:
     context: .
+  command: ./api_server
   volumes:
     - socks:/run/sock
   ulimits:
@@ -11,21 +12,37 @@ x-api: &api-common
     resources:
       limits:
         cpus: '0.45'
-        memory: 160M
+        memory: 120M
+
+x-api-env: &api-env
+  API_REFERENCES: resources/references.bin
+  API_NORMALIZATION: resources/normalization.json
+  API_MCC_RISK: resources/mcc_risk.json
+  API_REPAIR_MIN: "1"
+  API_REPAIR_MAX: "4"
+  API_NPROBE: "12"
+  API_BUSY_POLL_US: "50"
+  API_BUSY_POLL_BUDGET: "8"
+  API_PREFER_BUSY_POLL: "1"
+  API_EPOLL_TIMEOUT_MS: "1"
 
 services:
   api1:
     <<: *api-common
     container_name: api1
-    cpuset: "0"
-    command: ./api_server /run/sock/api1.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
+    environment:
+      <<: *api-env
+      API_CTRL: /run/sock/api1.ctrl
+      API_METRICS_PORT: "9901"
 
   api2:
     <<: *api-common
     container_name: api2
-    cpuset: "1"
-    command: ./api_server /run/sock/api2.ctrl resources/references.bin resources/normalization.json resources/mcc_risk.json
-
+    environment:
+      <<: *api-env
+      API_CTRL: /run/sock/api2.ctrl
+      API_METRICS_PORT: "9902"
+    
   lb:
     build:
       context: .
@@ -37,8 +54,10 @@ services:
     environment:
       - LB_PORT=9999
       - LB_BACKENDS=/run/sock/api1.ctrl,/run/sock/api2.ctrl
+      - LB_METRICS_PORT=9998
     ports:
       - "9999:9999"
+      - "9998:9998"
     volumes:
       - socks:/run/sock
     ulimits:
@@ -48,10 +67,38 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.1'
+          cpus: '0.10'
           memory: 30M
 
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:11.4.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=rinha
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_DATABASE_WAL=true
+      - GF_PLUGIN_BACKGROUND_INSTALLER_ENABLED=false
+      - GF_FEATURE_TOGGLES_ENABLE=
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
 volumes:
+  grafana_data:
   socks:
     driver: local
     driver_opts:

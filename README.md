@@ -41,25 +41,25 @@ flowchart TD
 
     CS["`**1. Centroid search**
 AVX2 pair-SoA scan over k=4096 centroids
-→ NPROBE=4 nearest cluster IDs`"] --> SC
+→ NPROBE=12 nearest cluster IDs`"] --> SC
 
     SC["`**2. Cluster scan**
 scan blocks of 8 vectors with 7× madd_epi16
-partial prune after 10/14 dims`"] --> CHK
+early prune after 6/14 and 10/14 dims`"] --> CHK
 
     CHK{"`cnt ∈ 1..4?`"}
     CHK -->|no — clear result| SCORE(["`fraud_score = cnt / 5`"])
     CHK -->|yes — ambiguous| REP
 
     REP["`**3. Repair pass**
-scan remaining k−4 clusters
-ordered by bbox lower bound
-prune if lb ≥ max_top`"] --> SCORE2(["`fraud_score = cnt / 5`"])
+scan remaining k−NPROBE clusters
+ordered by bbox lower bound (8 at a time via AVX2)
+early stop when result unambiguous`"] --> SCORE2(["`fraud_score = cnt / 5`"])
 ```
 
-1. **Centroid search** — find the `NPROBE` nearest cluster centroids using AVX2 distance accumulation over a prebuilt pair-SoA centroid table.
-2. **Cluster scan** — scan each selected cluster block-by-block with partial pruning: after 10 of 14 dimensions, skip a block if all 8 lanes already exceed the current worst-of-top-5.
-3. **Repair pass** — if the top-5 result is mixed (1–4 fraud out of 5), the initial probes may have missed the true neighborhood. A second pass scans all remaining clusters ordered by their bbox lower bound, pruning aggressively using the tightened max distance.
+1. **Centroid search** — find the `NPROBE` nearest cluster centroids using AVX2 distance accumulation over a prebuilt pair-SoA centroid table. Query pairs (`vq`) are computed once and reused across all three phases.
+2. **Cluster scan** — scan each selected cluster block-by-block with two partial prune checkpoints: after 6 of 14 dimensions and again after 10 of 14 dimensions, skip a block if all 8 lanes already exceed the current worst-of-top-5.
+3. **Repair pass** — if the top-5 result is mixed (1–4 fraud out of 5), the initial probes may have missed the true neighborhood. A second pass scans all remaining clusters ordered by their bbox lower bound, computed 8 clusters at a time via SIMD. Clusters already probed are skipped via a bitset. Scanning stops early once the result becomes unambiguous.
 
 ### Block memory layout (pair-SoA)
 
@@ -73,9 +73,9 @@ flowchart LR
 v0 v1 v2 v3 v4 v5 v6 v7`"]
         P1["`**pair 1** — d2·d3
 v0 v1 v2 v3 v4 v5 v6 v7`"]
-        P2["`**pair 2** — d4·d5`"]
+        P2["`**pair 2** — d4·d5  ← prune checkpoint (6/14)`"]
         P3["`**pair 3** — d6·d7`"]
-        P4["`**pair 4** — d8·d9  ← prune checkpoint`"]
+        P4["`**pair 4** — d8·d9  ← prune checkpoint (10/14)`"]
         P5["`**pair 5** — d10·d11`"]
         P6["`**pair 6** — d12·d13`"]
     end
@@ -84,14 +84,14 @@ v0 v1 v2 v3 v4 v5 v6 v7`"]
     B --- R
 ```
 
-Each pair row = one `__m256i` load (16 × int16). 7 rows × 16 × 2 bytes = **224 bytes per block**. The prune fires after pair 4 (10/14 dims covered).
+Each pair row = one `__m256i` load (16 × int16). 7 rows × 16 × 2 bytes = **224 bytes per block**. Prune fires after pair 2 (6/14 dims) and pair 4 (10/14 dims).
 
 ### Calibration parameters
 
 | Parameter | Value | Note |
 |---|---|---|
 | `k` (clusters) | 4096 | K-means cluster count used at build time |
-| `NPROBE` | 4 | Clusters probed per query |
+| `NPROBE` | 12 | Clusters probed per query |
 | Quantization scale | ×10000 | int16, range ±10000 |
 | Block size | 8 vectors | For AVX2 8-wide SIMD |
 | Repair condition | cnt ∈ [1, 4] | Triggers full index scan when result is ambiguous |
@@ -129,28 +129,28 @@ Normalization constants (`max_amount`, `max_km`, etc.) are preloaded from `norma
 - `src/server.cpp` — epoll HTTP server, parses requests, queries IVF, responds
 - `src/lb.cpp` — round-robin load balancer using SCM_RIGHTS fd passing
 - `src/ivf.hpp` — IVF index: layout, centroid SoA build, cluster scan, repair pass
-- `src/normalizer.hpp` — feature extraction and quantization
+- `src/normalizer.hpp` — feature extraction and quantization (custom zero-copy JSON parser)
+- `src/apm.hpp` — optional APM: latency histograms, Prometheus metrics endpoint
+- `src/flat_json.hpp` — minimal flat JSON key→float parser (used by normalizer at startup)
+- `src/metrics_server.hpp` — background HTTP thread for Prometheus scrape
 - `src/types.hpp` — shared binary format (IndexHeader, IndexLayout, constants)
-- `resources/` — JSON inputs: `references.json[.gz]`, `mcc_risk.json`
+- `resources/` — JSON inputs: `references.json[.gz]`, `mcc_risk.json`, `normalization.json`
 
-## Build
+## Build & Run
 
-```bash
-make install-deps
-make build
+| Command | Description |
+|---|---|
+| `make build` | Build Docker images |
+| `make run` | Build and start in background |
+| `make run-apm` | Build and start with Prometheus + Grafana |
+| `make down` | Stop all containers |
+| `make prune` | Stop, remove images, volumes, and local build |
+| `make cmake` | Local build via cmake (for development) |
+| `make convert` | Local build + convert `references.json` → `references.bin` |
+| `make format` | Format source with clang-format |
+| `make lint` | Lint source with clang-tidy |
 
-# convert references to binary IVF index
-./build/converter resources/references.json resources/references.bin
-
-# run a backend instance directly (normally done by docker-compose)
-./build/api_server /tmp/ctrl.sock resources/references.bin resources/normalization.json resources/mcc_risk.json
-```
-
-## Docker
-
-```bash
-docker-compose up --build
-```
+Server configuration is via environment variables (see `docker-compose.yml`): `API_NPROBE`, `API_REPAIR_MIN`, `API_REPAIR_MAX`, `API_BUSY_POLL_US`, `API_EPOLL_TIMEOUT_MS`.
 
 ## License
 

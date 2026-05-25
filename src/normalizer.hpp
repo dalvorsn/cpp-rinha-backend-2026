@@ -1,17 +1,14 @@
 #pragma once
 
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
-#include <vector>
 
-#include "simdjson.h"
-
-using namespace simdjson;
+#include "flat_json.hpp"
 
 struct StringHash {
   using is_transparent = void;
@@ -22,7 +19,6 @@ struct StringHash {
 
 class Normalizer {
  public:
-  // Precomputed reciprocals: multiplying is faster than dividing
   float inv_max_amount;
   float inv_max_installments;
   float inv_amount_vs_avg_ratio;
@@ -36,37 +32,33 @@ class Normalizer {
   Normalizer() {}
 
   bool load_config(const std::string& mcc_path, const std::string& norm_path) {
-    dom::parser parser;
-
-    // Load mcc_risk
-    dom::element doc;
-    auto error = parser.load(mcc_path).get(doc);
-    if (error) {
+    if (!parse_flat_floats(mcc_path, [&](std::string_view k, float v) {
+          mcc_risk.emplace(std::string(k), v);
+        })) {
       std::cerr << "[ERR] failed to load mcc_risk.json\n";
       return false;
     }
 
-    for (auto field : doc.get_object()) {
-      mcc_risk[std::string(field.key)] = (float)field.value.get_double();
-    }
-
-    // Load normalization constants and precompute reciprocals
-    error = parser.load(norm_path).get(doc);
-    if (error) {
+    std::unordered_map<std::string, float, StringHash, std::equal_to<>> norm;
+    if (!parse_flat_floats(norm_path, [&](std::string_view k, float v) {
+          norm.emplace(std::string(k), v);
+        })) {
       std::cerr << "[ERR] failed to load normalization.json\n";
       return false;
     }
 
-    dom::object obj = doc.get_object();
-    inv_max_amount = 1.0f / (float)obj["max_amount"].get_double();
-    inv_max_installments = 1.0f / (float)obj["max_installments"].get_double();
-    inv_amount_vs_avg_ratio =
-        1.0f / (float)obj["amount_vs_avg_ratio"].get_double();
-    inv_max_minutes = 1.0f / (float)obj["max_minutes"].get_double();
-    inv_max_km = 1.0f / (float)obj["max_km"].get_double();
-    inv_max_tx_count_24h = 1.0f / (float)obj["max_tx_count_24h"].get_double();
-    inv_max_merchant_avg_amount =
-        1.0f / (float)obj["max_merchant_avg_amount"].get_double();
+    auto get = [&](const char* key) -> float {
+      auto it = norm.find(std::string_view(key));
+      return it != norm.end() ? it->second : 1.0f;
+    };
+
+    inv_max_amount = 1.0f / get("max_amount");
+    inv_max_installments = 1.0f / get("max_installments");
+    inv_amount_vs_avg_ratio = 1.0f / get("amount_vs_avg_ratio");
+    inv_max_minutes = 1.0f / get("max_minutes");
+    inv_max_km = 1.0f / get("max_km");
+    inv_max_tx_count_24h = 1.0f / get("max_tx_count_24h");
+    inv_max_merchant_avg_amount = 1.0f / get("max_merchant_avg_amount");
 
     return true;
   }
@@ -77,11 +69,8 @@ class Normalizer {
     return val;
   }
 
-  // Fast epoch without syscall: calculates seconds since 1970-01-01 using pure
-  // arithmetic
   static inline int64_t fast_epoch(int y, int m, int d, int hh, int mm,
                                    int ss) {
-    // Civil-to-epoch conversion algorithm (Howard Hinnant)
     if (m <= 2) {
       y--;
       m += 9;
@@ -96,124 +85,210 @@ class Normalizer {
     return days * 86400 + hh * 3600 + mm * 60 + ss;
   }
 
-  // Weekday without syscall (0=Monday, 6=Sunday)
   static inline int fast_weekday(int y, int m, int d) {
-    // Tomohiko Sakamoto's algorithm
     static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
     if (m < 3) y--;
     int dow = (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
-    // Convert from 0=Sunday to 0=Monday
     return (dow + 6) % 7;
   }
 
-  void normalize(dom::element& req, int16_t* out) {
+  bool normalize_raw(const char* js, int jslen, int16_t* out) const noexcept {
     float vec[14];
-    normalize(req, vec);
-    for (int i = 0; i < 14; i++) {
-      // Use double + llround to match converter.cpp's quantize() exactly.
+    if (!parse_raw(js, jslen, vec)) return false;
+    for (int i = 0; i < 14; ++i) {
       double v = (double)vec[i] * 10000.0;
       if (v < -10000.0) v = -10000.0;
       if (v > 10000.0) v = 10000.0;
       out[i] = (int16_t)std::llround(v);
     }
+    return true;
   }
 
-  void normalize(dom::element& req, float* vec) {
-    dom::element transaction = req["transaction"];
-    dom::element customer = req["customer"];
-    dom::element merchant = req["merchant"];
-    dom::element terminal = req["terminal"];
-    dom::element last_tx_val = req["last_transaction"];
+ private:
+  static float fast_f32(const char* p) noexcept {
+    uint32_t w = 0;
+    while ((unsigned)(*p - '0') <= 9u) w = w * 10u + (uint32_t)(*p++ - '0');
+    if (*p != '.') return (float)w;
+    ++p;
+    uint32_t f = 0, d = 1;
+    while ((unsigned)(*p - '0') <= 9u && d < 100000000u) {
+      f = f * 10u + (uint32_t)(*p++ - '0');
+      d *= 10u;
+    }
+    return (float)w + (float)f / (float)d;
+  }
 
-    float amount = (float)transaction["amount"].get_double();
-    float installments = (float)transaction["installments"].get_double();
-    std::string_view requested_at_str =
-        transaction["requested_at"].get_string().value();
+  bool parse_raw(const char* js, int jslen, float* vec) const noexcept {
+    const char *p = js, *end = js + jslen;
+    enum Sec : uint8_t { ROOT, TX, CUST, MERCH, TERM, LAST };
+    Sec sec = ROOT;
+    int depth = 0;
 
-    float cust_avg_amount = (float)customer["avg_amount"].get_double();
-    float tx_count_24h = (float)customer["tx_count_24h"].get_double();
+    float tx_amount = 0, tx_inst = 0, cust_avg = 0, cnt24 = 0;
+    float merch_avg = 0, km_home = 0, km_cur = 0;
+    bool is_online = false, card_present = false, has_last = false;
+    const char *rat = nullptr, *last_ts = nullptr;
+    const char* mid = nullptr;
+    int mid_len = 0;
+    const char* mcc_p = nullptr;
+    int mcc_len = 0;
 
-    std::string_view merchant_id = merchant["id"].get_string().value();
-    std::string_view mcc = merchant["mcc"].get_string().value();
-    float merchant_avg_amount = (float)merchant["avg_amount"].get_double();
+    struct SV {
+      const char* p;
+      int n;
+    };
+    SV kms[32];
+    int km_cnt = 0;
 
-    bool is_online = terminal["is_online"].get_bool();
-    bool card_present = terminal["card_present"].get_bool();
-    float km_from_home = (float)terminal["km_from_home"].get_double();
+    while (p < end) {
+      char c = *p++;
+      if (c == '{') {
+        ++depth;
+        continue;
+      }
+      if (c == '}') {
+        if (--depth == 1) sec = ROOT;
+        continue;
+      }
+      if (c != '"') continue;
 
-    // 0. amount — no round4, ball tree doesn't need it
-    vec[0] = clampf(amount * inv_max_amount);
+      const char* key = p;
+      while (p < end && *p != '"') ++p;
+      int klen = (int)(p - key);
+      if (p < end) ++p;
 
-    // 1. installments
-    vec[1] = clampf(installments * inv_max_installments);
+      while (p < end && (*p == ' ' || *p == '\t')) ++p;
+      if (p >= end || *p != ':') continue;
+      ++p;
+      while (p < end && (*p == ' ' || *p == '\t')) ++p;
+      if (p >= end) return false;
 
-    // 2. amount_vs_avg
-    float avg_safe = cust_avg_amount > 0.0f ? cust_avg_amount : 1.0f;
-    vec[2] = clampf((amount / avg_safe) * inv_amount_vs_avg_ratio);
+#define KEY(lit) \
+  (klen == (int)(sizeof(lit) - 1) && memcmp(key, lit, sizeof(lit) - 1) == 0)
+      switch (sec) {
+        case ROOT:
+          if (KEY("transaction"))
+            sec = TX;
+          else if (KEY("customer"))
+            sec = CUST;
+          else if (KEY("merchant"))
+            sec = MERCH;
+          else if (KEY("terminal"))
+            sec = TERM;
+          else if (KEY("last_transaction") && *p != 'n') {
+            has_last = true;
+            sec = LAST;
+          }
+          break;
+        case TX:
+          if (KEY("amount"))
+            tx_amount = fast_f32(p);
+          else if (KEY("installments"))
+            tx_inst = fast_f32(p);
+          else if (KEY("requested_at"))
+            rat = p + 1;
+          break;
+        case CUST:
+          if (KEY("avg_amount"))
+            cust_avg = fast_f32(p);
+          else if (KEY("tx_count_24h"))
+            cnt24 = fast_f32(p);
+          else if (KEY("known_merchants") && *p == '[') {
+            ++p;
+            while (p < end && *p != ']') {
+              while (p < end && *p != '"' && *p != ']') ++p;
+              if (p >= end || *p == ']') break;
+              const char* s = ++p;
+              while (p < end && *p != '"') ++p;
+              if (km_cnt < 32) kms[km_cnt++] = {s, (int)(p - s)};
+              if (p < end) ++p;
+            }
+            if (p < end) ++p;
+          }
+          break;
+        case MERCH:
+          if (KEY("id")) {
+            mid = p + 1;
+            const char* q = mid;
+            while (q < end && *q != '"') ++q;
+            mid_len = (int)(q - mid);
+          } else if (KEY("mcc")) {
+            mcc_p = p + 1;
+            const char* q = mcc_p;
+            while (q < end && *q != '"') ++q;
+            mcc_len = (int)(q - mcc_p);
+          } else if (KEY("avg_amount")) {
+            merch_avg = fast_f32(p);
+          }
+          break;
+        case TERM:
+          if (KEY("is_online"))
+            is_online = (*p == 't');
+          else if (KEY("card_present"))
+            card_present = (*p == 't');
+          else if (KEY("km_from_home"))
+            km_home = fast_f32(p);
+          break;
+        case LAST:
+          if (KEY("timestamp"))
+            last_ts = p + 1;
+          else if (KEY("km_from_current"))
+            km_cur = fast_f32(p);
+          break;
+      }
+#undef KEY
+    }
 
-    // 3. hour_of_day & 4. day_of_week — parse inline without timegm
-    int y = (requested_at_str[0] - '0') * 1000 +
-            (requested_at_str[1] - '0') * 100 +
-            (requested_at_str[2] - '0') * 10 + (requested_at_str[3] - '0');
-    int mo = (requested_at_str[5] - '0') * 10 + (requested_at_str[6] - '0');
-    int dy = (requested_at_str[8] - '0') * 10 + (requested_at_str[9] - '0');
-    int hh = (requested_at_str[11] - '0') * 10 + (requested_at_str[12] - '0');
-    int mi = (requested_at_str[14] - '0') * 10 + (requested_at_str[15] - '0');
-    int ss = (requested_at_str[17] - '0') * 10 + (requested_at_str[18] - '0');
+    if (!rat || !mid) return false;
 
+    int y = (rat[0] - '0') * 1000 + (rat[1] - '0') * 100 + (rat[2] - '0') * 10 +
+            (rat[3] - '0');
+    int mo = (rat[5] - '0') * 10 + (rat[6] - '0');
+    int dy = (rat[8] - '0') * 10 + (rat[9] - '0');
+    int hh = (rat[11] - '0') * 10 + (rat[12] - '0');
+    int mi = (rat[14] - '0') * 10 + (rat[15] - '0');
+    int ss = (rat[17] - '0') * 10 + (rat[18] - '0');
+
+    vec[0] = clampf(tx_amount * inv_max_amount);
+    vec[1] = clampf(tx_inst * inv_max_installments);
+    vec[2] = clampf((tx_amount / (cust_avg > 0.0f ? cust_avg : 1.0f)) *
+                    inv_amount_vs_avg_ratio);
     vec[3] = (float)hh * (1.0f / 23.0f);
     vec[4] = (float)fast_weekday(y, mo, dy) * (1.0f / 6.0f);
 
-    // 5. minutes_since_last_tx & 6. km_from_last_tx
-    if (last_tx_val.is_null()) {
+    if (!has_last || !last_ts) {
       vec[5] = -1.0f;
       vec[6] = -1.0f;
     } else {
-      dom::object last_tx = last_tx_val.get_object();
-      std::string_view last_ts_str = last_tx["timestamp"].get_string().value();
-      float km_from_current = (float)last_tx["km_from_current"].get_double();
-
-      int ly = (last_ts_str[0] - '0') * 1000 + (last_ts_str[1] - '0') * 100 +
-               (last_ts_str[2] - '0') * 10 + (last_ts_str[3] - '0');
-      int lmo = (last_ts_str[5] - '0') * 10 + (last_ts_str[6] - '0');
-      int ld = (last_ts_str[8] - '0') * 10 + (last_ts_str[9] - '0');
-      int lhh = (last_ts_str[11] - '0') * 10 + (last_ts_str[12] - '0');
-      int lmi = (last_ts_str[14] - '0') * 10 + (last_ts_str[15] - '0');
-      int lss = (last_ts_str[17] - '0') * 10 + (last_ts_str[18] - '0');
-
-      int64_t req_epoch = fast_epoch(y, mo, dy, hh, mi, ss);
-      int64_t last_epoch = fast_epoch(ly, lmo, ld, lhh, lmi, lss);
-      float diff_minutes = (float)(req_epoch - last_epoch) / 60.0f;
-
-      vec[5] = clampf(diff_minutes * inv_max_minutes);
-      vec[6] = clampf(km_from_current * inv_max_km);
+      int ly = (last_ts[0] - '0') * 1000 + (last_ts[1] - '0') * 100 +
+               (last_ts[2] - '0') * 10 + (last_ts[3] - '0');
+      int lmo = (last_ts[5] - '0') * 10 + (last_ts[6] - '0');
+      int ld = (last_ts[8] - '0') * 10 + (last_ts[9] - '0');
+      int lhh = (last_ts[11] - '0') * 10 + (last_ts[12] - '0');
+      int lmi = (last_ts[14] - '0') * 10 + (last_ts[15] - '0');
+      int lss = (last_ts[17] - '0') * 10 + (last_ts[18] - '0');
+      int64_t req_e = fast_epoch(y, mo, dy, hh, mi, ss);
+      int64_t last_e = fast_epoch(ly, lmo, ld, lhh, lmi, lss);
+      vec[5] = clampf((float)(req_e - last_e) / 60.0f * inv_max_minutes);
+      vec[6] = clampf(km_cur * inv_max_km);
     }
 
-    // 7. km_from_home
-    vec[7] = clampf(km_from_home * inv_max_km);
-
-    // 8. tx_count_24h
-    vec[8] = clampf(tx_count_24h * inv_max_tx_count_24h);
-
-    // 9. is_online & 10. card_present
+    vec[7] = clampf(km_home * inv_max_km);
+    vec[8] = clampf(cnt24 * inv_max_tx_count_24h);
     vec[9] = is_online ? 1.0f : 0.0f;
     vec[10] = card_present ? 1.0f : 0.0f;
 
-    // 11. unknown_merchant
     bool known = false;
-    for (auto km : customer["known_merchants"].get_array()) {
-      if (km.get_string().value() == merchant_id) {
-        known = true;
-        break;
-      }
-    }
+    for (int i = 0; i < km_cnt && !known; ++i)
+      known =
+          (kms[i].n == mid_len && memcmp(kms[i].p, mid, (size_t)mid_len) == 0);
     vec[11] = known ? 0.0f : 1.0f;
 
-    // 12. mcc_risk
-    auto it = mcc_risk.find(mcc);
-    vec[12] = it != mcc_risk.end() ? it->second : 0.5f;
+    std::string_view sv(mcc_p ? mcc_p : "", (size_t)mcc_len);
+    auto it = mcc_risk.find(sv);
+    vec[12] = (it != mcc_risk.end()) ? it->second : 0.5f;
 
-    // 13. merchant_avg_amount
-    vec[13] = clampf(merchant_avg_amount * inv_max_merchant_avg_amount);
+    vec[13] = clampf(merch_avg * inv_max_merchant_avg_amount);
+    return true;
   }
 };

@@ -1,0 +1,438 @@
+{
+  "title": "Rinha Backend 2026",
+  "uid": "rinha2026",
+  "schemaVersion": 38,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "panels": [
+    {
+      "id": 2,
+      "title": "End-to-end latency (ms)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.50, rate(rinha_latency_ms_bucket[30s]))",
+          "legendFormat": "p50 {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_latency_ms_bucket[30s]))",
+          "legendFormat": "p99 {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.999, rate(rinha_latency_ms_bucket[30s]))",
+          "legendFormat": "p99.9 {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "RPS over time",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 1, "fillOpacity": 10 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "rate(rinha_requests_total[30s])",
+          "legendFormat": "{{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(rinha_requests_total[30s]))",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Wait time — arrival → process (ms)",
+      "description": "arrival_wait: tempo desde o SCM_RIGHTS handoff do LB até score_transaction. within-batch: desde que epoll_wait retornou até handle_client_read. A diferença entre os dois é o tempo que o request ficou na fila enquanto outros do mesmo batch eram processados.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.50, rate(rinha_arrival_wait_ms_bucket[30s]))",
+          "legendFormat": "arrival p50 {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_arrival_wait_ms_bucket[30s]))",
+          "legendFormat": "arrival p99 {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.999, rate(rinha_arrival_wait_ms_bucket[30s]))",
+          "legendFormat": "arrival p99.9 {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_queue_ms_bucket[30s]))",
+          "legendFormat": "within-batch p99 {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "epoll batch size (events/call)",
+      "description": "Distribuição de nfds retornados por epoll_wait. Encodado como fake-ns: bucket le=N.000 = N eventos. Query multiplica por 1000 pra recuperar a contagem. p99 ≈ 512 (MAX_EVTS) = saturado.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 8, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.50, rate(rinha_epoll_batch_size_bucket[30s])) * 1000",
+          "legendFormat": "p50 {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.90, rate(rinha_epoll_batch_size_bucket[30s])) * 1000",
+          "legendFormat": "p90 {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_epoll_batch_size_bucket[30s])) * 1000",
+          "legendFormat": "p99 {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Active connections",
+      "description": "Conexões de cliente registradas no epoll. Crescimento sustentado = LB entrega mais rápido do que o server processa.",
+      "type": "timeseries",
+      "gridPos": { "x": 20, "y": 8, "w": 4, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 1, "fillOpacity": 15 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "rinha_active_conns",
+          "legendFormat": "{{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rinha_active_conns)",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "title": "Stage breakdown — P99 (ms)",
+      "description": "Onde o tempo vai dentro de cada request. arrival_wait domina? = fila no epoll loop. ivf domina? = IVF/repair é o gargalo.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_arrival_wait_ms_bucket[30s]))",
+          "legendFormat": "arrival wait {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_queue_ms_bucket[30s]))",
+          "legendFormat": "within-batch wait {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_parse_ms_bucket[30s]))",
+          "legendFormat": "parse {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_normalize_ms_bucket[30s]))",
+          "legendFormat": "normalize {{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, rate(rinha_ivf_ms_bucket[30s]))",
+          "legendFormat": "ivf {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "CPU utilization — api1 / api2 / lb",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": { "lineWidth": 1, "fillOpacity": 8 }
+        },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "rate(rinha_cgroup_cpu_usage_seconds_total{mode=\"total\",instance=\"api1\"}[30s]) / on(instance) rinha_cgroup_cpu_limit_cores",
+          "legendFormat": "api1",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "rate(rinha_cgroup_cpu_usage_seconds_total{mode=\"total\",instance=\"api2\"}[30s]) / on(instance) rinha_cgroup_cpu_limit_cores",
+          "legendFormat": "api2",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "rate(rinha_lb_cgroup_cpu_usage_seconds_total{mode=\"total\"}[30s]) / on(instance) rinha_lb_cgroup_cpu_limit_cores",
+          "legendFormat": "lb",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "rate(rinha_cgroup_cpu_throttled_seconds_total{instance=\"api1\"}[30s]) / on(instance) rinha_cgroup_cpu_limit_cores",
+          "legendFormat": "api1 throttle",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "rate(rinha_cgroup_cpu_throttled_seconds_total{instance=\"api2\"}[30s]) / on(instance) rinha_cgroup_cpu_limit_cores",
+          "legendFormat": "api2 throttle",
+          "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "rate(rinha_lb_cgroup_cpu_throttled_seconds_total[30s]) / on(instance) rinha_lb_cgroup_cpu_limit_cores",
+          "legendFormat": "lb throttle",
+          "refId": "F"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Latency heatmap — IVF (ms)",
+      "description": "Distribuição da latência do IVF search. Bimodal = repair pass disparando em alguns requests.",
+      "type": "heatmap",
+      "gridPos": { "x": 0, "y": 25, "w": 12, "h": 8 },
+      "options": {
+        "calculate": false,
+        "yAxis": { "unit": "ms" },
+        "color": { "scheme": "Oranges" }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(rinha_ivf_ms_bucket[30s])) by (le)",
+          "legendFormat": "{{le}}",
+          "format": "heatmap"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Latency heatmap — end-to-end (ms)",
+      "type": "heatmap",
+      "gridPos": { "x": 12, "y": 25, "w": 12, "h": 8 },
+      "options": {
+        "calculate": false,
+        "yAxis": { "unit": "ms" },
+        "color": { "scheme": "Blues" }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(rinha_latency_ms_bucket[30s])) by (le)",
+          "legendFormat": "{{le}}",
+          "format": "heatmap"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Memory usage — api1 / api2",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 33, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "lineWidth": 1, "fillOpacity": 10 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "rinha_memory_bytes_current{instance=\"api1\"}",
+          "legendFormat": "api1",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "rinha_memory_bytes_current{instance=\"api2\"}",
+          "legendFormat": "api2",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "IVF repair rate",
+      "description": "% dos requests que dispararam o repair pass (should_repair ou cnt em [repair_min,repair_max]). Alto = mais caro. Bimodal no heatmap do IVF confirma.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 40, "w": 16, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 1, "fillOpacity": 10 }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "mean", "max"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "rate(rinha_repair_total[30s]) / rate(rinha_requests_total[30s])",
+          "legendFormat": "{{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(rinha_repair_total[30s])) / sum(rate(rinha_requests_total[30s]))",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "IVF repair throughput (repairs/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 40, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 1, "fillOpacity": 8 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "rate(rinha_repair_total[30s])",
+          "legendFormat": "{{instance}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(rinha_repair_total[30s]))",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "LB — connections routed & errors",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 33, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 1, "fillOpacity": 10 }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "rate(rinha_lb_connections_accepted_total[30s])",
+          "legendFormat": "routed backend={{backend}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "rate(rinha_lb_connect_errors_total[30s])",
+          "legendFormat": "errors backend={{backend}}"
+        }
+      ]
+    }
+  ]
+}

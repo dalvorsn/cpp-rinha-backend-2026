@@ -1,16 +1,17 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <vector>
 
-#include "jsmn.h"
+#include "simdjson.h"
+
+using namespace simdjson;
 
 struct StringHash {
   using is_transparent = void;
@@ -19,49 +20,9 @@ struct StringHash {
   }
 };
 
-// ---------------------------------------------------------------------------
-// jsmn tree helpers
-// ---------------------------------------------------------------------------
-
-static inline int jsmn_subtree(const jsmntok_t *t, int ntoks, int idx) {
-  if (idx >= ntoks) return 0;
-  int n = 1;
-  int pos = idx + 1;
-  for (int i = 0; i < t[idx].size; i++) {
-    int s = jsmn_subtree(t, ntoks, pos);
-    pos += s;
-    n += s;
-  }
-  return n;
-}
-
-// Returns token index of the value for 'key' inside OBJECT at toks[obj],
-// or -1 if not found.
-static inline int jsmn_find(const char *js, const jsmntok_t *t, int ntoks,
-                             int obj, const char *key, int klen) {
-  if (obj < 0 || obj >= ntoks || t[obj].type != JSMN_OBJECT) return -1;
-  int pos = obj + 1;
-  for (int i = 0; i < t[obj].size && pos < ntoks; i++) {
-    if (t[pos].type == JSMN_STRING && t[pos].end - t[pos].start == klen &&
-        memcmp(js + t[pos].start, key, klen) == 0)
-      return pos + 1;
-    pos += jsmn_subtree(t, ntoks, pos);
-  }
-  return -1;
-}
-
-static inline float jsmn_f32(const char *js, const jsmntok_t *t, int i) {
-  return (float)strtod(js + t[i].start, nullptr);
-}
-
-static inline bool jsmn_b(const char *js, const jsmntok_t *t, int i) {
-  return js[t[i].start] == 't';
-}
-
-// ---------------------------------------------------------------------------
-
 class Normalizer {
  public:
+  // Precomputed reciprocals: multiplying is faster than dividing
   float inv_max_amount;
   float inv_max_installments;
   float inv_amount_vs_avg_ratio;
@@ -72,124 +33,315 @@ class Normalizer {
 
   std::unordered_map<std::string, float, StringHash, std::equal_to<>> mcc_risk;
 
-  Normalizer() = default;
+  Normalizer() {}
 
-  bool load_config(const std::string &mcc_path,
-                   const std::string &norm_path) noexcept {
-    // ── mcc_risk.json ─────────────────────────────────────────────────────
-    {
-      std::vector<char> buf;
-      if (!read_file(mcc_path, buf)) {
-        fprintf(stderr, "[ERR] failed to open %s\n", mcc_path.c_str());
-        return false;
-      }
-      // ≤10000 MCC codes → ≤20001 tokens (root obj + 2 per entry)
-      std::vector<jsmntok_t> toks(20002);
-      jsmn_parser p; jsmn_init(&p);
-      int ntoks = jsmn_parse(&p, buf.data(), buf.size() - 1,
-                             toks.data(), (unsigned)toks.size());
-      if (ntoks < 1 || toks[0].type != JSMN_OBJECT) {
-        fprintf(stderr, "[ERR] bad mcc_risk.json\n");
-        return false;
-      }
-      int pos = 1;
-      for (int i = 0; i < toks[0].size && pos + 1 < ntoks; i++) {
-        const jsmntok_t &k = toks[pos], &v = toks[pos + 1];
-        if (k.type == JSMN_STRING && v.type == JSMN_PRIMITIVE)
-          mcc_risk[std::string(buf.data() + k.start, k.end - k.start)] =
-              (float)strtod(buf.data() + v.start, nullptr);
-        pos += jsmn_subtree(toks.data(), ntoks, pos);
-      }
+  bool load_config(const std::string& mcc_path, const std::string& norm_path) {
+    dom::parser parser;
+
+    // Load mcc_risk
+    dom::element doc;
+    auto error = parser.load(mcc_path).get(doc);
+    if (error) {
+      std::cerr << "[ERR] failed to load mcc_risk.json\n";
+      return false;
     }
 
-    // ── normalization.json ────────────────────────────────────────────────
-    {
-      std::vector<char> buf;
-      if (!read_file(norm_path, buf)) {
-        fprintf(stderr, "[ERR] failed to open %s\n", norm_path.c_str());
-        return false;
-      }
-      jsmntok_t toks[32]; jsmn_parser p; jsmn_init(&p);
-      int ntoks = jsmn_parse(&p, buf.data(), buf.size() - 1, toks, 32);
-      if (ntoks < 1 || toks[0].type != JSMN_OBJECT) {
-        fprintf(stderr, "[ERR] bad normalization.json\n");
-        return false;
-      }
-#define LI(field, key)                                                        \
-  {                                                                            \
-    int vi = jsmn_find(buf.data(), toks, ntoks, 0, key, (int)sizeof(key)-1); \
-    if (vi < 0) { fprintf(stderr, "[ERR] missing " key "\n"); return false; } \
-    field = 1.0f / jsmn_f32(buf.data(), toks, vi);                           \
-  }
-      LI(inv_max_amount,              "max_amount")
-      LI(inv_max_installments,        "max_installments")
-      LI(inv_amount_vs_avg_ratio,     "amount_vs_avg_ratio")
-      LI(inv_max_minutes,             "max_minutes")
-      LI(inv_max_km,                  "max_km")
-      LI(inv_max_tx_count_24h,        "max_tx_count_24h")
-      LI(inv_max_merchant_avg_amount, "max_merchant_avg_amount")
-#undef LI
+    for (auto field : doc.get_object()) {
+      mcc_risk[std::string(field.key)] = (float)field.value.get_double();
     }
+
+    // Load normalization constants and precompute reciprocals
+    error = parser.load(norm_path).get(doc);
+    if (error) {
+      std::cerr << "[ERR] failed to load normalization.json\n";
+      return false;
+    }
+
+    dom::object obj = doc.get_object();
+    inv_max_amount = 1.0f / (float)obj["max_amount"].get_double();
+    inv_max_installments = 1.0f / (float)obj["max_installments"].get_double();
+    inv_amount_vs_avg_ratio =
+        1.0f / (float)obj["amount_vs_avg_ratio"].get_double();
+    inv_max_minutes = 1.0f / (float)obj["max_minutes"].get_double();
+    inv_max_km = 1.0f / (float)obj["max_km"].get_double();
+    inv_max_tx_count_24h = 1.0f / (float)obj["max_tx_count_24h"].get_double();
+    inv_max_merchant_avg_amount =
+        1.0f / (float)obj["max_merchant_avg_amount"].get_double();
+
     return true;
   }
 
-  // Hot path: parse + normalize in one call. Returns false on malformed JSON.
-  bool normalize(const char *js, int jslen, int16_t *out) const noexcept {
+  static inline float clampf(float val) {
+    if (val < 0.0f) return 0.0f;
+    if (val > 1.0f) return 1.0f;
+    return val;
+  }
+
+  // Fast epoch without syscall: calculates seconds since 1970-01-01 using pure
+  // arithmetic
+  static inline int64_t fast_epoch(int y, int m, int d, int hh, int mm,
+                                   int ss) {
+    // Civil-to-epoch conversion algorithm (Howard Hinnant)
+    if (m <= 2) {
+      y--;
+      m += 9;
+    } else {
+      m -= 3;
+    }
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * m + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = era * 146097 + (int64_t)doe - 719468;
+    return days * 86400 + hh * 3600 + mm * 60 + ss;
+  }
+
+  // Weekday without syscall (0=Monday, 6=Sunday)
+  static inline int fast_weekday(int y, int m, int d) {
+    // Tomohiko Sakamoto's algorithm
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) y--;
+    int dow = (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+    // Convert from 0=Sunday to 0=Monday
+    return (dow + 6) % 7;
+  }
+
+  void normalize(dom::element& req, int16_t* out) {
     float vec[14];
-    if (!normalize_f(js, jslen, vec)) return false;
+    normalize(req, vec);
     for (int i = 0; i < 14; i++) {
+      // Use double + llround to match converter.cpp's quantize() exactly.
       double v = (double)vec[i] * 10000.0;
       if (v < -10000.0) v = -10000.0;
       if (v > 10000.0) v = 10000.0;
       out[i] = (int16_t)std::llround(v);
     }
+  }
+
+  void normalize(dom::element& req, float* vec) {
+    dom::element transaction = req["transaction"];
+    dom::element customer = req["customer"];
+    dom::element merchant = req["merchant"];
+    dom::element terminal = req["terminal"];
+    dom::element last_tx_val = req["last_transaction"];
+
+    float amount = (float)transaction["amount"].get_double();
+    float installments = (float)transaction["installments"].get_double();
+    std::string_view requested_at_str =
+        transaction["requested_at"].get_string().value();
+
+    float cust_avg_amount = (float)customer["avg_amount"].get_double();
+    float tx_count_24h = (float)customer["tx_count_24h"].get_double();
+
+    std::string_view merchant_id = merchant["id"].get_string().value();
+    std::string_view mcc = merchant["mcc"].get_string().value();
+    float merchant_avg_amount = (float)merchant["avg_amount"].get_double();
+
+    bool is_online = terminal["is_online"].get_bool();
+    bool card_present = terminal["card_present"].get_bool();
+    float km_from_home = (float)terminal["km_from_home"].get_double();
+
+    // 0. amount — no round4, ball tree doesn't need it
+    vec[0] = clampf(amount * inv_max_amount);
+
+    // 1. installments
+    vec[1] = clampf(installments * inv_max_installments);
+
+    // 2. amount_vs_avg
+    float avg_safe = cust_avg_amount > 0.0f ? cust_avg_amount : 1.0f;
+    vec[2] = clampf((amount / avg_safe) * inv_amount_vs_avg_ratio);
+
+    // 3. hour_of_day & 4. day_of_week — parse inline without timegm
+    int y = (requested_at_str[0] - '0') * 1000 +
+            (requested_at_str[1] - '0') * 100 +
+            (requested_at_str[2] - '0') * 10 + (requested_at_str[3] - '0');
+    int mo = (requested_at_str[5] - '0') * 10 + (requested_at_str[6] - '0');
+    int dy = (requested_at_str[8] - '0') * 10 + (requested_at_str[9] - '0');
+    int hh = (requested_at_str[11] - '0') * 10 + (requested_at_str[12] - '0');
+    int mi = (requested_at_str[14] - '0') * 10 + (requested_at_str[15] - '0');
+    int ss = (requested_at_str[17] - '0') * 10 + (requested_at_str[18] - '0');
+
+    vec[3] = (float)hh * (1.0f / 23.0f);
+    vec[4] = (float)fast_weekday(y, mo, dy) * (1.0f / 6.0f);
+
+    // 5. minutes_since_last_tx & 6. km_from_last_tx
+    if (last_tx_val.is_null()) {
+      vec[5] = -1.0f;
+      vec[6] = -1.0f;
+    } else {
+      dom::object last_tx = last_tx_val.get_object();
+      std::string_view last_ts_str = last_tx["timestamp"].get_string().value();
+      float km_from_current = (float)last_tx["km_from_current"].get_double();
+
+      int ly = (last_ts_str[0] - '0') * 1000 + (last_ts_str[1] - '0') * 100 +
+               (last_ts_str[2] - '0') * 10 + (last_ts_str[3] - '0');
+      int lmo = (last_ts_str[5] - '0') * 10 + (last_ts_str[6] - '0');
+      int ld = (last_ts_str[8] - '0') * 10 + (last_ts_str[9] - '0');
+      int lhh = (last_ts_str[11] - '0') * 10 + (last_ts_str[12] - '0');
+      int lmi = (last_ts_str[14] - '0') * 10 + (last_ts_str[15] - '0');
+      int lss = (last_ts_str[17] - '0') * 10 + (last_ts_str[18] - '0');
+
+      int64_t req_epoch = fast_epoch(y, mo, dy, hh, mi, ss);
+      int64_t last_epoch = fast_epoch(ly, lmo, ld, lhh, lmi, lss);
+      float diff_minutes = (float)(req_epoch - last_epoch) / 60.0f;
+
+      vec[5] = clampf(diff_minutes * inv_max_minutes);
+      vec[6] = clampf(km_from_current * inv_max_km);
+    }
+
+    // 7. km_from_home
+    vec[7] = clampf(km_from_home * inv_max_km);
+
+    // 8. tx_count_24h
+    vec[8] = clampf(tx_count_24h * inv_max_tx_count_24h);
+
+    // 9. is_online & 10. card_present
+    vec[9] = is_online ? 1.0f : 0.0f;
+    vec[10] = card_present ? 1.0f : 0.0f;
+
+    // 11. unknown_merchant
+    bool known = false;
+    for (auto km : customer["known_merchants"].get_array()) {
+      if (km.get_string().value() == merchant_id) {
+        known = true;
+        break;
+      }
+    }
+    vec[11] = known ? 0.0f : 1.0f;
+
+    // 12. mcc_risk
+    auto it = mcc_risk.find(mcc);
+    vec[12] = it != mcc_risk.end() ? it->second : 0.5f;
+
+    // 13. merchant_avg_amount
+    vec[13] = clampf(merchant_avg_amount * inv_max_merchant_avg_amount);
+  }
+
+  // Hot path: specialized zero-copy parser for the rinha fraud-score payload.
+  // Single forward pass, no tokenization stage, no DOM allocation.
+  bool normalize_raw(const char *js, int jslen, int16_t *out) const noexcept {
+    float vec[14];
+    if (!parse_raw(js, jslen, vec)) return false;
+    for (int i = 0; i < 14; ++i) {
+      double v = (double)vec[i] * 10000.0;
+      if (v < -10000.0) v = -10000.0;
+      if (v > 10000.0)  v = 10000.0;
+      out[i] = (int16_t)std::llround(v);
+    }
     return true;
   }
 
-  bool normalize_f(const char *js, int jslen, float *vec) const noexcept {
-    jsmntok_t toks[128]; jsmn_parser p; jsmn_init(&p);
-    int ntoks = jsmn_parse(&p, js, (size_t)jslen, toks, 128);
-    if (ntoks < 1 || toks[0].type != JSMN_OBJECT) return false;
+ private:
+  // Parse non-negative float without strtod.
+  static float fast_f32(const char *p) noexcept {
+    uint32_t w = 0;
+    while ((unsigned)(*p - '0') <= 9u) w = w * 10u + (uint32_t)(*p++ - '0');
+    if (*p != '.') return (float)w;
+    ++p;
+    uint32_t f = 0, d = 1;
+    while ((unsigned)(*p - '0') <= 9u && d < 100000000u) {
+      f = f * 10u + (uint32_t)(*p++ - '0');
+      d *= 10u;
+    }
+    return (float)w + (float)f / (float)d;
+  }
 
-    // transaction
-    int tx = jsmn_find(js, toks, ntoks, 0, "transaction", 11);
-    if (tx < 0) return false;
-    int amt_i  = jsmn_find(js, toks, ntoks, tx, "amount",       6);
-    int inst_i = jsmn_find(js, toks, ntoks, tx, "installments", 12);
-    int rat_i  = jsmn_find(js, toks, ntoks, tx, "requested_at", 12);
-    if (amt_i < 0 || inst_i < 0 || rat_i < 0) return false;
+  bool parse_raw(const char *js, int jslen, float *vec) const noexcept {
+    const char *p = js, *end = js + jslen;
+    enum Sec : uint8_t { ROOT, TX, CUST, MERCH, TERM, LAST };
+    Sec sec = ROOT;
+    int depth = 0;
 
-    float amount       = jsmn_f32(js, toks, amt_i);
-    float installments = jsmn_f32(js, toks, inst_i);
-    const char *rat    = js + toks[rat_i].start;
+    float tx_amount = 0, tx_inst = 0, cust_avg = 0, cnt24 = 0;
+    float merch_avg = 0, km_home = 0, km_cur = 0;
+    bool is_online = false, card_present = false, has_last = false;
+    const char *rat = nullptr, *last_ts = nullptr;
+    const char *mid = nullptr; int mid_len = 0;
+    const char *mcc_p = nullptr; int mcc_len = 0;
 
-    // customer
-    int cust = jsmn_find(js, toks, ntoks, 0, "customer", 8);
-    if (cust < 0) return false;
-    int cavg_i  = jsmn_find(js, toks, ntoks, cust, "avg_amount",   10);
-    int cnt24_i = jsmn_find(js, toks, ntoks, cust, "tx_count_24h", 12);
-    if (cavg_i < 0 || cnt24_i < 0) return false;
+    struct SV { const char *p; int n; };
+    SV kms[32]; int km_cnt = 0;
 
-    float cust_avg = jsmn_f32(js, toks, cavg_i);
-    float cnt24    = jsmn_f32(js, toks, cnt24_i);
+    while (p < end) {
+      char c = *p++;
+      if (c == '{') { ++depth; continue; }
+      if (c == '}') {
+        if (--depth == 1) sec = ROOT;
+        continue;
+      }
+      if (c != '"') continue;
 
-    // merchant
-    int merch = jsmn_find(js, toks, ntoks, 0, "merchant", 8);
-    if (merch < 0) return false;
-    int mid_i  = jsmn_find(js, toks, ntoks, merch, "id",         2);
-    int mcc_i  = jsmn_find(js, toks, ntoks, merch, "mcc",        3);
-    int mavg_i = jsmn_find(js, toks, ntoks, merch, "avg_amount", 10);
-    if (mid_i < 0 || mcc_i < 0 || mavg_i < 0) return false;
+      // Read key candidate up to next '"', then require ':'.
+      const char *key = p;
+      while (p < end && *p != '"') ++p;
+      int klen = (int)(p - key);
+      if (p < end) ++p;  // skip closing '"'
 
-    // terminal
-    int term = jsmn_find(js, toks, ntoks, 0, "terminal", 8);
-    if (term < 0) return false;
-    int ionl_i  = jsmn_find(js, toks, ntoks, term, "is_online",    9);
-    int cpres_i = jsmn_find(js, toks, ntoks, term, "card_present", 12);
-    int kmh_i   = jsmn_find(js, toks, ntoks, term, "km_from_home", 12);
-    if (ionl_i < 0 || cpres_i < 0 || kmh_i < 0) return false;
+      while (p < end && (*p == ' ' || *p == '\t')) ++p;
+      if (p >= end || *p != ':') continue;  // string value, not a key
+      ++p;
+      while (p < end && (*p == ' ' || *p == '\t')) ++p;
+      if (p >= end) return false;
 
-    // requested_at: "YYYY-MM-DDTHH:MM:SSZ"
+      // p points at the value. Dispatch by (section, key length, first char).
+      switch (sec) {
+      case ROOT:
+        if      (klen == 11)                  sec = TX;    // "transaction"
+        else if (klen ==  8 && key[0] == 'c') sec = CUST;  // "customer"
+        else if (klen ==  8 && key[0] == 'm') sec = MERCH; // "merchant"
+        else if (klen ==  8 && key[0] == 't') sec = TERM;  // "terminal"
+        else if (klen == 16 && *p != 'n')   { has_last = true; sec = LAST; }
+        break;                                              // "last_transaction"
+      case TX:
+        if      (klen ==  6)                  tx_amount = fast_f32(p);
+        else if (klen == 12 && key[0] == 'i') tx_inst   = fast_f32(p);
+        else if (klen == 12 && key[0] == 'r') rat       = p + 1;  // skip '"'
+        break;
+      case CUST:
+        if      (klen == 10)                  cust_avg = fast_f32(p);
+        else if (klen == 12)                  cnt24    = fast_f32(p);
+        else if (klen == 15 && *p == '[') {   // "known_merchants"
+          ++p;  // consume '['
+          while (p < end && *p != ']') {
+            while (p < end && *p != '"' && *p != ']') ++p;
+            if (p >= end || *p == ']') break;
+            const char *s = ++p;  // skip opening '"'
+            while (p < end && *p != '"') ++p;
+            if (km_cnt < 32) kms[km_cnt++] = {s, (int)(p - s)};
+            if (p < end) ++p;  // skip closing '"'
+          }
+          if (p < end) ++p;  // consume ']'
+        }
+        break;
+      case MERCH:
+        if (klen == 2) {                      // "id"
+          mid = p + 1;
+          const char *q = mid;
+          while (q < end && *q != '"') ++q;
+          mid_len = (int)(q - mid);
+        } else if (klen == 3) {               // "mcc"
+          mcc_p = p + 1;
+          const char *q = mcc_p;
+          while (q < end && *q != '"') ++q;
+          mcc_len = (int)(q - mcc_p);
+        } else if (klen == 10) {              // "avg_amount"
+          merch_avg = fast_f32(p);
+        }
+        break;
+      case TERM:
+        if      (klen ==  9)                  is_online    = (*p == 't');
+        else if (klen == 12 && key[0] == 'c') card_present = (*p == 't');
+        else if (klen == 12 && key[0] == 'k') km_home      = fast_f32(p);
+        break;
+      case LAST:
+        if      (klen ==  9) last_ts = p + 1;  // "timestamp", skip '"'
+        else if (klen == 15) km_cur  = fast_f32(p);
+        break;
+      }
+    }
+
+    if (!rat || !mid) return false;
+
     int y  = (rat[0]-'0')*1000+(rat[1]-'0')*100+(rat[2]-'0')*10+(rat[3]-'0');
     int mo = (rat[5]-'0')*10+(rat[6]-'0');
     int dy = (rat[8]-'0')*10+(rat[9]-'0');
@@ -197,108 +349,46 @@ class Normalizer {
     int mi = (rat[14]-'0')*10+(rat[15]-'0');
     int ss = (rat[17]-'0')*10+(rat[18]-'0');
 
-    vec[0] = clampf(amount * inv_max_amount);
-    vec[1] = clampf(installments * inv_max_installments);
-    {
-      float safe = cust_avg > 0.0f ? cust_avg : 1.0f;
-      vec[2] = clampf((amount / safe) * inv_amount_vs_avg_ratio);
-    }
+    vec[0] = clampf(tx_amount * inv_max_amount);
+    vec[1] = clampf(tx_inst * inv_max_installments);
+    vec[2] = clampf((tx_amount / (cust_avg > 0.0f ? cust_avg : 1.0f))
+                    * inv_amount_vs_avg_ratio);
     vec[3] = (float)hh * (1.0f / 23.0f);
     vec[4] = (float)fast_weekday(y, mo, dy) * (1.0f / 6.0f);
 
-    // last_transaction (nullable)
-    int lt    = jsmn_find(js, toks, ntoks, 0, "last_transaction", 16);
-    bool has_lt = (lt >= 0 && lt < ntoks && toks[lt].type == JSMN_OBJECT);
-    if (!has_lt) {
-      vec[5] = -1.0f; vec[6] = -1.0f;
+    if (!has_last || !last_ts) {
+      vec[5] = -1.0f;
+      vec[6] = -1.0f;
     } else {
-      int lts_i = jsmn_find(js, toks, ntoks, lt, "timestamp",       9);
-      int lkm_i = jsmn_find(js, toks, ntoks, lt, "km_from_current", 15);
-      if (lts_i < 0 || lkm_i < 0) {
-        vec[5] = -1.0f; vec[6] = -1.0f;
-      } else {
-        const char *lts = js + toks[lts_i].start;
-        int ly  = (lts[0]-'0')*1000+(lts[1]-'0')*100+(lts[2]-'0')*10+(lts[3]-'0');
-        int lmo = (lts[5]-'0')*10+(lts[6]-'0');
-        int ld  = (lts[8]-'0')*10+(lts[9]-'0');
-        int lhh = (lts[11]-'0')*10+(lts[12]-'0');
-        int lmi = (lts[14]-'0')*10+(lts[15]-'0');
-        int lss = (lts[17]-'0')*10+(lts[18]-'0');
-
-        int64_t req_e  = fast_epoch(y,  mo,  dy,  hh,  mi,  ss);
-        int64_t last_e = fast_epoch(ly, lmo, ld,  lhh, lmi, lss);
-        vec[5] = clampf((float)(req_e - last_e) / 60.0f * inv_max_minutes);
-        vec[6] = clampf(jsmn_f32(js, toks, lkm_i) * inv_max_km);
-      }
+      int ly  = (last_ts[0]-'0')*1000+(last_ts[1]-'0')*100
+               +(last_ts[2]-'0')*10+(last_ts[3]-'0');
+      int lmo = (last_ts[5]-'0')*10+(last_ts[6]-'0');
+      int ld  = (last_ts[8]-'0')*10+(last_ts[9]-'0');
+      int lhh = (last_ts[11]-'0')*10+(last_ts[12]-'0');
+      int lmi = (last_ts[14]-'0')*10+(last_ts[15]-'0');
+      int lss = (last_ts[17]-'0')*10+(last_ts[18]-'0');
+      int64_t req_e  = fast_epoch(y,  mo, dy,  hh, mi, ss);
+      int64_t last_e = fast_epoch(ly, lmo, ld, lhh, lmi, lss);
+      vec[5] = clampf((float)(req_e - last_e) / 60.0f * inv_max_minutes);
+      vec[6] = clampf(km_cur * inv_max_km);
     }
 
-    vec[7]  = clampf(jsmn_f32(js, toks, kmh_i) * inv_max_km);
+    vec[7]  = clampf(km_home * inv_max_km);
     vec[8]  = clampf(cnt24 * inv_max_tx_count_24h);
-    vec[9]  = jsmn_b(js, toks, ionl_i)  ? 1.0f : 0.0f;
-    vec[10] = jsmn_b(js, toks, cpres_i) ? 1.0f : 0.0f;
+    vec[9]  = is_online   ? 1.0f : 0.0f;
+    vec[10] = card_present ? 1.0f : 0.0f;
 
-    // known_merchants: linear scan
     bool known = false;
-    int kma = jsmn_find(js, toks, ntoks, cust, "known_merchants", 15);
-    if (kma >= 0 && kma < ntoks && toks[kma].type == JSMN_ARRAY) {
-      int n_km = toks[kma].size;
-      int pos  = kma + 1;
-      int ms = toks[mid_i].start, ml = toks[mid_i].end - toks[mid_i].start;
-      for (int i = 0; i < n_km && pos < ntoks; i++) {
-        const jsmntok_t &m = toks[pos];
-        if (m.type == JSMN_STRING && m.end - m.start == ml &&
-            memcmp(js + m.start, js + ms, ml) == 0) {
-          known = true; break;
-        }
-        pos += jsmn_subtree(toks, ntoks, pos);
-      }
-    }
+    for (int i = 0; i < km_cnt && !known; ++i)
+      known = (kms[i].n == mid_len &&
+               memcmp(kms[i].p, mid, (size_t)mid_len) == 0);
     vec[11] = known ? 0.0f : 1.0f;
 
-    std::string_view mcc_sv(js + toks[mcc_i].start,
-                             toks[mcc_i].end - toks[mcc_i].start);
-    auto it = mcc_risk.find(mcc_sv);
+    std::string_view sv(mcc_p ? mcc_p : "", (size_t)mcc_len);
+    auto it = mcc_risk.find(sv);
     vec[12] = (it != mcc_risk.end()) ? it->second : 0.5f;
 
-    vec[13] = clampf(jsmn_f32(js, toks, mavg_i) * inv_max_merchant_avg_amount);
+    vec[13] = clampf(merch_avg * inv_max_merchant_avg_amount);
     return true;
-  }
-
- private:
-  static bool read_file(const std::string &path,
-                        std::vector<char> &out) noexcept {
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    rewind(f);
-    out.resize((size_t)sz + 1);
-    fread(out.data(), 1, (size_t)sz, f);
-    fclose(f);
-    out[(size_t)sz] = '\0';
-    return true;
-  }
-
-  static float clampf(float v) noexcept {
-    if (v < 0.0f) return 0.0f;
-    if (v > 1.0f) return 1.0f;
-    return v;
-  }
-
-  static int64_t fast_epoch(int y, int m, int d, int hh, int mm,
-                             int ss) noexcept {
-    if (m <= 2) { y--; m += 9; } else { m -= 3; }
-    int64_t era = (y >= 0 ? y : y - 399) / 400;
-    unsigned yoe = (unsigned)(y - era * 400);
-    unsigned doy = (153 * m + 2) / 5 + (unsigned)d - 1;
-    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    int64_t days = era * 146097 + (int64_t)doe - 719468;
-    return days * 86400 + hh * 3600 + mm * 60 + ss;
-  }
-
-  static int fast_weekday(int y, int m, int d) noexcept {
-    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-    if (m < 3) y--;
-    return ((y + y/4 - y/100 + y/400 + t[m-1] + d) % 7 + 6) % 7;
   }
 };

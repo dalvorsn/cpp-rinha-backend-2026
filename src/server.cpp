@@ -11,12 +11,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 
 #include <sys/ioctl.h>
 
@@ -81,6 +79,7 @@ static IVF* ivf = nullptr;
 static Normalizer normalizer;
 static int g_repair_min = 2;
 static int g_repair_max = 3;
+static int g_epoll_timeout_ms = 1;
 
 // epoll busy-poll params (Linux 6.0+, EPIOCSPARAMS ioctl)
 #ifndef EPIOCSPARAMS
@@ -92,24 +91,7 @@ struct epoll_params {
 };
 #define EPIOCSPARAMS _IOW('p', 0x01, struct epoll_params)
 #endif
-
-// Two epoll configs: [0]=low-RPS, [1]=high-RPS
-static struct epoll_params g_epoll_cfg[2]     = {};
-static int                 g_epoll_timeout[2] = {1, 0};
-static int                 g_epoll_mode       = 0;  // active mode index
-
-// RPS tracking (always-on, no APM dependency)
-static std::atomic<uint64_t> g_req_count{0};
-static uint64_t g_rps_win_start = 0;
-static uint64_t g_rps_win_count = 0;
-static float    g_ema_rps       = 0.0f;
-static uint32_t g_rps_threshold = 5000;   // reqs/s above which HIGH is used
-
-static uint64_t mono_ns() noexcept {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
+static struct epoll_params g_epoll_params = {};
 static int epfd = -1;
 static int ctrl_listen_fd = -1;
 #ifdef ENABLE_APM
@@ -328,35 +310,25 @@ static int score_transaction(Conn* c) {
 #endif
 
   int16_t vec[14];
-  bool ok = normalizer.normalize(body, blen, vec);
+  bool ok = normalizer.normalize_raw(body, blen, vec);
 
 #ifdef ENABLE_APM
   apm.stopRecord("rinha_normalize_ms");
 #endif
 
-  if (!ok) {
-#ifdef ENABLE_APM
-    apm.stopRecord("rinha_latency_ms");
-#endif
-    return 6;
-  }
+  if (!ok) return 6;
 
 #ifdef ENABLE_APM
   apm.startRecord("rinha_ivf_ms");
 #endif
-
   bool repaired = false;
   int cnt = ivf->get_fraud_count(vec, &repaired);
-
-  g_req_count.fetch_add(1, std::memory_order_relaxed);
-
 #ifdef ENABLE_APM
   if (repaired) apm.recordRepair();
   apm.stopRecord("rinha_ivf_ms");
   apm.stopRecord("rinha_latency_ms");
   apm.recordRequest();
 #endif
-
   return cnt;
 }
 
@@ -431,16 +403,7 @@ static void handle_client_read(int fd) {
   const bool is_post = c->buf[0] == 'P';
   if (is_post && c->buf_len - c->headers_size < c->content_len) return;
 
-  int score;
-  if (is_post && c->buf_len >= 22 &&
-      memcmp(c->buf, "POST /fraud-score ", 18) == 0) {
-    score = score_transaction(c);
-  } else if (!is_post && c->buf_len >= 11 &&
-             memcmp(c->buf, "GET /ready ", 11) == 0) {
-    score = -1;
-  } else {
-    score = 6;
-  }
+  int score = is_post ? score_transaction(c) : -1;
 
   int consumed = c->headers_size + (is_post ? c->content_len : 0);
   int leftover = c->buf_len - consumed;
@@ -543,46 +506,28 @@ int main(int argc, char* argv[]) {
   const char* nprobe_str      = getenv("API_NPROBE");
   const char* rmin_str        = getenv("API_REPAIR_MIN");
   const char* rmax_str        = getenv("API_REPAIR_MAX");
-  // low-RPS epoll config
   const char* busy_poll_str   = getenv("API_BUSY_POLL_US");
   const char* busy_budget_str = getenv("API_BUSY_POLL_BUDGET");
   const char* prefer_bp_str   = getenv("API_PREFER_BUSY_POLL");
   const char* epoll_to_str    = getenv("API_EPOLL_TIMEOUT_MS");
-  // high-RPS epoll config
-  const char* hi_poll_str     = getenv("API_HIGH_BUSY_POLL_US");
-  const char* hi_budget_str   = getenv("API_HIGH_BUSY_POLL_BUDGET");
-  const char* hi_prefer_str   = getenv("API_HIGH_PREFER_BUSY_POLL");
-  const char* hi_to_str       = getenv("API_HIGH_EPOLL_TIMEOUT_MS");
-  // RPS threshold
-  const char* rps_thr_str     = getenv("API_RPS_THRESHOLD");
 
   if (!ctrl_path || !refs_path || !norm_path || !mcc_path) {
     fprintf(stderr,
             "Required env vars: API_CTRL API_REFERENCES "
             "API_NORMALIZATION API_MCC_RISK\n"
             "Optional: API_METRICS_PORT API_NPROBE API_REPAIR_MIN API_REPAIR_MAX\n"
-            "  low-RPS:  API_BUSY_POLL_US API_BUSY_POLL_BUDGET"
-            " API_PREFER_BUSY_POLL API_EPOLL_TIMEOUT_MS\n"
-            "  high-RPS: API_HIGH_BUSY_POLL_US API_HIGH_BUSY_POLL_BUDGET"
-            " API_HIGH_PREFER_BUSY_POLL API_HIGH_EPOLL_TIMEOUT_MS\n"
-            "  switching: API_RPS_THRESHOLD (default 5000)\n");
+            "         API_BUSY_POLL_US API_BUSY_POLL_BUDGET\n"
+            "         API_PREFER_BUSY_POLL API_EPOLL_TIMEOUT_MS\n");
     return 1;
   }
 
   int g_nprobe = nprobe_str ? atoi(nprobe_str) : 4;
-  if (rmin_str)        g_repair_min                         = atoi(rmin_str);
-  if (rmax_str)        g_repair_max                         = atoi(rmax_str);
-  // low config (index 0)
-  if (busy_poll_str)   g_epoll_cfg[0].busy_poll_usecs       = (uint32_t)atoi(busy_poll_str);
-  if (busy_budget_str) g_epoll_cfg[0].busy_poll_budget      = (uint16_t)atoi(busy_budget_str);
-  if (prefer_bp_str)   g_epoll_cfg[0].prefer_busy_poll      = (uint8_t)atoi(prefer_bp_str);
-  if (epoll_to_str)    g_epoll_timeout[0]                   = atoi(epoll_to_str);
-  // high config (index 1) — defaults: no busy poll, non-blocking epoll_wait
-  if (hi_poll_str)     g_epoll_cfg[1].busy_poll_usecs       = (uint32_t)atoi(hi_poll_str);
-  if (hi_budget_str)   g_epoll_cfg[1].busy_poll_budget      = (uint16_t)atoi(hi_budget_str);
-  if (hi_prefer_str)   g_epoll_cfg[1].prefer_busy_poll      = (uint8_t)atoi(hi_prefer_str);
-  if (hi_to_str)       g_epoll_timeout[1]                   = atoi(hi_to_str);
-  if (rps_thr_str)     g_rps_threshold                      = (uint32_t)atoi(rps_thr_str);
+  if (rmin_str)        g_repair_min                    = atoi(rmin_str);
+  if (rmax_str)        g_repair_max                    = atoi(rmax_str);
+  if (busy_poll_str)   g_epoll_params.busy_poll_usecs  = (uint32_t)atoi(busy_poll_str);
+  if (busy_budget_str) g_epoll_params.busy_poll_budget = (uint16_t)atoi(busy_budget_str);
+  if (prefer_bp_str)   g_epoll_params.prefer_busy_poll = (uint8_t)atoi(prefer_bp_str);
+  if (epoll_to_str)    g_epoll_timeout_ms              = atoi(epoll_to_str);
 
   for (int i = 0; i < 6; i++) {
     full_resp_len[i] = snprintf(full_resp[i], sizeof(full_resp[i]),
@@ -597,7 +542,7 @@ int main(int argc, char* argv[]) {
                      "Within-batch wait: epoll_wait returned to score_transaction called");
   apm.registerMetric("rinha_arrival_wait_ms",
                      "True wait: LB handoff (accept_from_lb) to score_transaction start");
-  apm.registerMetric("rinha_normalize_ms", "JSON parse + feature normalize latency");
+  apm.registerMetric("rinha_normalize_ms", "JSON parse + normalize latency");
   apm.registerMetric("rinha_ivf_ms",
                      "IVF nearest-neighbor search latency (includes repair)");
   apm.registerMetric("rinha_epoll_batch_size",
@@ -633,29 +578,6 @@ int main(int argc, char* argv[]) {
   }
   fprintf(stderr, "[INFO] normalizer loaded\n");
 
-  // Warm up IVF + normalizer caches before accepting connections.
-  if (getenv("API_WARMUP") && atoi(getenv("API_WARMUP")) > 0) {
-    int n_warm = atoi(getenv("API_WARMUP"));
-    static const char WARM_JSON[] =
-        "{\"id\":\"w\","
-        "\"transaction\":{\"amount\":384.88,\"installments\":3,"
-        "\"requested_at\":\"2026-03-11T20:23:35Z\"},"
-        "\"customer\":{\"avg_amount\":769.76,\"tx_count_24h\":3,"
-        "\"known_merchants\":[\"MERC-001\"]},"
-        "\"merchant\":{\"id\":\"MERC-001\",\"mcc\":\"5912\","
-        "\"avg_amount\":298.95},"
-        "\"terminal\":{\"is_online\":false,\"card_present\":true,"
-        "\"km_from_home\":13.7},"
-        "\"last_transaction\":{\"timestamp\":\"2026-03-11T14:58:35Z\","
-        "\"km_from_current\":18.8}}";
-    int16_t vec[14];
-    for (int i = 0; i < n_warm; i++) {
-      if (normalizer.normalize(WARM_JSON, (int)(sizeof(WARM_JSON) - 1), vec))
-        ivf->get_fraud_count(vec, nullptr);
-    }
-    fprintf(stderr, "[INFO] warmup done (%d queries)\n", n_warm);
-  }
-
 #ifdef ENABLE_APM
   apm.init();
 #endif
@@ -679,20 +601,14 @@ int main(int argc, char* argv[]) {
 #endif
 
   epfd = epoll_create1(0);
-  // Apply initial (low-RPS) config
-  if (g_epoll_cfg[0].busy_poll_usecs || g_epoll_cfg[0].prefer_busy_poll) {
-    if (ioctl(epfd, EPIOCSPARAMS, &g_epoll_cfg[0]) < 0)
+  if (g_epoll_params.busy_poll_usecs || g_epoll_params.prefer_busy_poll) {
+    if (ioctl(epfd, EPIOCSPARAMS, &g_epoll_params) < 0)
       fprintf(stderr, "[WARN] EPIOCSPARAMS: %s\n", strerror(errno));
     else
-      fprintf(stderr, "[INFO] epoll[low]  poll=%uus budget=%u prefer=%u timeout=%dms\n",
-              g_epoll_cfg[0].busy_poll_usecs, g_epoll_cfg[0].busy_poll_budget,
-              g_epoll_cfg[0].prefer_busy_poll, g_epoll_timeout[0]);
+      fprintf(stderr, "[INFO] epoll busy_poll=%uus budget=%u prefer=%u\n",
+              g_epoll_params.busy_poll_usecs, g_epoll_params.busy_poll_budget,
+              g_epoll_params.prefer_busy_poll);
   }
-  fprintf(stderr, "[INFO] epoll[high] poll=%uus budget=%u prefer=%u timeout=%dms"
-                  " | threshold=%u rps\n",
-          g_epoll_cfg[1].busy_poll_usecs, g_epoll_cfg[1].busy_poll_budget,
-          g_epoll_cfg[1].prefer_busy_poll, g_epoll_timeout[1], g_rps_threshold);
-  g_rps_win_start = mono_ns();
   struct epoll_event ev;
   ev.events = EPOLLIN;
   ev.data.fd = ctrl_listen_fd;
@@ -710,40 +626,12 @@ int main(int argc, char* argv[]) {
 
   struct epoll_event events[MAX_EVTS];
   while (true) {
-    int nfds = epoll_wait(epfd, events, MAX_EVTS, g_epoll_timeout[g_epoll_mode]);
+    int nfds = epoll_wait(epfd, events, MAX_EVTS, g_epoll_timeout_ms);
     if (nfds < 0) {
       if (errno == EINTR) continue;
       perror("epoll_wait");
       break;
     }
-
-    // RPS measurement and epoll mode switching (every ~500ms)
-    {
-      uint64_t now = mono_ns();
-      if (now - g_rps_win_start >= 500000000ULL) {
-        double elapsed = (double)(now - g_rps_win_start) / 1e9;
-        uint64_t cnt   = g_req_count.load(std::memory_order_relaxed);
-        double   wps   = (double)(cnt - g_rps_win_count) / elapsed;
-        g_rps_win_start = now;
-        g_rps_win_count = cnt;
-        // Exponential moving average (α=0.3) for stability
-        g_ema_rps = g_ema_rps * 0.7f + (float)wps * 0.3f;
-
-        // Hysteresis: switch UP at threshold, switch DOWN at 80% of threshold
-        int want = (g_ema_rps >= (float)g_rps_threshold)          ? 1
-                 : (g_ema_rps <  (float)g_rps_threshold * 0.80f)  ? 0
-                 : g_epoll_mode;
-        if (want != g_epoll_mode) {
-          g_epoll_mode = want;
-          if (ioctl(epfd, EPIOCSPARAMS, &g_epoll_cfg[want]) < 0)
-            fprintf(stderr, "[WARN] EPIOCSPARAMS switch: %s\n", strerror(errno));
-          else
-            fprintf(stderr, "[INFO] epoll -> %s (ema_rps=%.0f)\n",
-                    want ? "HIGH" : "LOW", (double)g_ema_rps);
-        }
-      }
-    }
-
     if (nfds == 0) continue;
 #ifdef ENABLE_APM
     apm.push("rinha_epoll_batch_size", (uint64_t)nfds * 1000);

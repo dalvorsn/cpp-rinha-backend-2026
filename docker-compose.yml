@@ -21,20 +21,10 @@ x-api-env: &api-env
   API_NPROBE: "12"
   API_REPAIR_MIN: "1"
   API_REPAIR_MAX: "4"
-  # RPS threshold to switch configs
-  API_RPS_THRESHOLD: "900"
-  # low-RPS epoll config (used below API_RPS_THRESHOLD)
   API_BUSY_POLL_US: "50"
   API_BUSY_POLL_BUDGET: "8"
   API_PREFER_BUSY_POLL: "1"
   API_EPOLL_TIMEOUT_MS: "1"
-  # high-RPS epoll config (used at or above API_RPS_THRESHOLD)
-  API_HIGH_BUSY_POLL_US: "0"
-  API_HIGH_BUSY_POLL_BUDGET: "0"
-  API_HIGH_PREFER_BUSY_POLL: "0"
-  API_HIGH_EPOLL_TIMEOUT_MS: "-1"
-  # warmup: número de queries fake ao iniciar (0 = desligado)
-  API_WARMUP: "0"
 
 services:
   api1:

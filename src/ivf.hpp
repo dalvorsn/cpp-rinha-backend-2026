@@ -61,11 +61,14 @@ class IVF {
     blocks = (const int16_t*)((char*)file_data + lo.blocks);
 
     build_cpsoa();
+    build_bpsoa();
   }
 
   ~IVF() {
     free(file_data);
     free(cpsoa);
+    free(bpsoa_min);
+    free(bpsoa_max);
   }
 
   static constexpr int MAX_NPROBE = 16;
@@ -119,6 +122,10 @@ class IVF {
   // Group g, pair p: cpsoa[(g*IVF_PAIRS+p)*16 .. +15]
   //   = [c0.2p, c0.2p+1, c1.2p, c1.2p+1, ..., c7.2p, c7.2p+1]
   int16_t* cpsoa = nullptr;
+  // Bbox pair-SoA: same layout as cpsoa, for bbox_min and bbox_max.
+  // Used to compute 8 bbox lower bounds simultaneously in repair().
+  int16_t* bpsoa_min = nullptr;
+  int16_t* bpsoa_max = nullptr;
   uint32_t n_groups = 0;
 
   // Broadcast [q[2p], q[2p+1]] × 8 as int16 packed into int32 lanes.
@@ -152,6 +159,54 @@ class IVF {
         }
       }
     }
+  }
+
+  void build_bpsoa() {
+    const size_t sz = size_t(n_groups) * IVF_PAIRS * 16 * sizeof(int16_t);
+    bpsoa_min = (int16_t*)aligned_alloc(32, sz);
+    bpsoa_max = (int16_t*)aligned_alloc(32, sz);
+    if (!bpsoa_min || !bpsoa_max) {
+      perror("bpsoa alloc");
+      std::exit(1);
+    }
+    memset(bpsoa_min, 0, sz);
+    memset(bpsoa_max, 0, sz);
+    for (uint32_t g = 0; g < n_groups; g++) {
+      for (int p = 0; p < IVF_PAIRS; p++) {
+        int16_t* dmin = bpsoa_min + (size_t(g) * IVF_PAIRS + p) * 16;
+        int16_t* dmax = bpsoa_max + (size_t(g) * IVF_PAIRS + p) * 16;
+        for (int lane = 0; lane < 8; lane++) {
+          const uint32_t c = g * 8 + (uint32_t)lane;
+          if (c < k) {
+            dmin[lane * 2]     = bbox_min[size_t(c) * IVF_DIMS + p * 2];
+            dmin[lane * 2 + 1] = bbox_min[size_t(c) * IVF_DIMS + p * 2 + 1];
+            dmax[lane * 2]     = bbox_max[size_t(c) * IVF_DIMS + p * 2];
+            dmax[lane * 2 + 1] = bbox_max[size_t(c) * IVF_DIMS + p * 2 + 1];
+          }
+        }
+      }
+    }
+  }
+
+  // Compute bbox lower bounds for 8 clusters in group g simultaneously.
+  // vq must be precomputed via make_qpair for each pair.
+  // lbs[8] receives the 8 lower bounds (may include phantom clusters if k%8 != 0).
+  __attribute__((always_inline)) inline void bbox_lower_bound_8(
+      uint32_t g, const __m256i* vq, uint32_t* lbs) const {
+    const int16_t* smin = bpsoa_min + size_t(g) * IVF_PAIRS * 16;
+    const int16_t* smax = bpsoa_max + size_t(g) * IVF_PAIRS * 16;
+    __m256i acc = _mm256_setzero_si256();
+    for (int p = 0; p < IVF_PAIRS; p++) {
+      __m256i vmn = _mm256_loadu_si256((const __m256i*)(smin + p * 16));
+      __m256i vmx = _mm256_loadu_si256((const __m256i*)(smax + p * 16));
+      __m256i gap_lo = _mm256_max_epi16(_mm256_setzero_si256(),
+                                        _mm256_sub_epi16(vmn, vq[p]));
+      __m256i gap_hi = _mm256_max_epi16(_mm256_setzero_si256(),
+                                        _mm256_sub_epi16(vq[p], vmx));
+      __m256i gap = _mm256_max_epi16(gap_lo, gap_hi);
+      acc = _mm256_add_epi32(acc, _mm256_madd_epi16(gap, gap));
+    }
+    _mm256_storeu_si256((__m256i*)lbs, acc);
   }
 
   // Fill `out[0..n-1]` with the n nearest centroid indices, sorted ascending.
@@ -235,20 +290,30 @@ class IVF {
     acc = _mm256_add_epi32(acc, _mm256_madd_epi16(df, df));              \
   }
     for (uint32_t bi = blk_start; bi < blk_end; bi++) {
+      if (bi + 2 < blk_end)
+        __builtin_prefetch(blocks + size_t(bi + 2) * IVF_DIMS * IVF_BLOCK, 0, 1);
       const int16_t* blk = blocks + size_t(bi) * IVF_DIMS * IVF_BLOCK;
+
+      // Capture max_top at block start — uses the tightest available value
+      __m256i vmax =
+          _mm256_set1_epi32((int32_t)std::min(max_top, (uint32_t)INT32_MAX));
 
       __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
       SPAIR(0, acc0);
       SPAIR(1, acc1);
       SPAIR(2, acc0);
+
+      // Early prune at 6/14 dims: skip if all 8 lanes already >= max_top
+      if (_mm256_movemask_epi8(
+              _mm256_cmpgt_epi32(vmax, _mm256_add_epi32(acc0, acc1))) == 0)
+        continue;
+
       SPAIR(3, acc1);
       SPAIR(4, acc0);
 
-      // Partial prune: after 10/14 dims, skip if all 8 lanes already >= max_top
-      __m256i combined = _mm256_add_epi32(acc0, acc1);
-      __m256i vmax =
-          _mm256_set1_epi32((int32_t)std::min(max_top, (uint32_t)INT32_MAX));
-      if (_mm256_movemask_epi8(_mm256_cmpgt_epi32(vmax, combined)) == 0)
+      // Prune at 10/14 dims
+      if (_mm256_movemask_epi8(
+              _mm256_cmpgt_epi32(vmax, _mm256_add_epi32(acc0, acc1))) == 0)
         continue;
 
       SPAIR(5, acc1);
@@ -266,54 +331,52 @@ class IVF {
 #undef SPAIR
   }
 
-  uint32_t bbox_lower_bound(uint32_t c, const int16_t* q) const {
-    const int16_t* mn = bbox_min + size_t(c) * IVF_DIMS;
-    const int16_t* mx = bbox_max + size_t(c) * IVF_DIMS;
-    // Vectorize first 8 dims: load 8×int16 → 8×int32, compute gap², hsum
-    __m256i vq = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i*)q));
-    __m256i vmn = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i*)mn));
-    __m256i vmx = _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i*)mx));
-    __m256i gap = _mm256_max_epi32(
-        _mm256_setzero_si256(),
-        _mm256_max_epi32(_mm256_sub_epi32(vmn, vq), _mm256_sub_epi32(vq, vmx)));
-    __m256i sq = _mm256_mullo_epi32(gap, gap);
-    __m128i lo = _mm256_castsi256_si128(sq);
-    __m128i hi = _mm256_extracti128_si256(sq, 1);
-    __m128i s = _mm_add_epi32(lo, hi);
-    s = _mm_hadd_epi32(s, s);
-    s = _mm_hadd_epi32(s, s);
-    uint32_t lb = (uint32_t)_mm_cvtsi128_si32(s);
-    // Scalar tail for remaining 6 dims
-    for (int d = 8; d < IVF_DIMS; d++) {
-      int32_t g = q[d] < mn[d] ? mn[d] - q[d] : q[d] > mx[d] ? q[d] - mx[d] : 0;
-      lb += (uint32_t)(g * g);
-    }
-    return lb;
-  }
 
   void repair(const int16_t* q, const uint32_t* skip, int nskip,
               uint32_t* top_dists, uint8_t* top_labels,
               uint32_t& max_top) const {
-    struct Cand {
-      uint32_t lb;
-      uint32_t c;
-    };
-    static thread_local Cand cands[4096];
+    struct Cand { uint32_t lb; uint32_t c; };
+    static thread_local Cand cands[1024];
     int ncands = 0;
 
-    for (uint32_t c = 0; c < k; c++) {
-      if (counts[c] == 0) continue;
-      bool skipped = false;
-      for (int s = 0; s < nskip; s++)
-        if (c == skip[s]) {
-          skipped = true;
-          break;
-        }
-      if (skipped) continue;
-      uint32_t lb = bbox_lower_bound(c, q);
-      if (lb < max_top) cands[ncands++] = {lb, c};
+    // O(1) skip check per cluster via bitset (replaces O(nskip) linear scan)
+    uint64_t skip_set[64] = {};
+    for (int s = 0; s < nskip; s++)
+      skip_set[skip[s] >> 6] |= 1ULL << (skip[s] & 63);
+
+    // Precompute query pairs once for all 8-cluster bbox groups
+    __m256i vq[IVF_PAIRS];
+    for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
+
+    // Signed comparison: clip max_top to INT32_MAX to avoid sign issues
+    const __m256i vmt =
+        _mm256_set1_epi32((int32_t)std::min(max_top, (uint32_t)INT32_MAX));
+
+    uint32_t lbs[8];
+    for (uint32_t g = 0; g < n_groups; g++) {
+      // Compute bbox lower bounds for all 8 clusters in this group at once
+      bbox_lower_bound_8(g, vq, lbs);
+
+      // SIMD filter: which of the 8 clusters have lb < max_top?
+      // _mm256_cmpgt_epi32 sets lane to 0xFFFFFFFF if vmt > vlbs (i.e. lb < max_top)
+      __m256i vlbs = _mm256_loadu_si256((const __m256i*)lbs);
+      int pass_mask =
+          _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(vmt, vlbs)));
+      if (!pass_mask) continue;
+
+      const uint32_t base = g * 8;
+      int m = pass_mask;
+      while (m) {
+        int i = __builtin_ctz(m);
+        m &= m - 1;
+        const uint32_t c = base + (uint32_t)i;
+        if (c >= k) continue;
+        if (skip_set[c >> 6] & (1ULL << (c & 63))) continue;
+        if (counts[c] == 0) continue;
+        if (ncands < 1024) cands[ncands++] = {lbs[i], c};
+      }
     }
-    // Sort nearest-first: scanning nearest clusters tightens max_top fastest
+
     std::sort(cands, cands + ncands,
               [](const Cand& a, const Cand& b) { return a.lb < b.lb; });
     for (int i = 0; i < ncands; i++) {

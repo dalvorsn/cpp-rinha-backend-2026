@@ -175,6 +175,19 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
   std::vector<uint32_t> order(n);
   for (uint32_t i = 0; i < n; ++i) order[cursor[assignment[i]]++] = i;
 
+  // Sort vectors within each cluster by ascending distance to centroid.
+  // Nearest-first ordering causes max_top to tighten faster during scan_cluster,
+  // improving the effectiveness of the partial-distance pruning at 6 and 10 dims.
+  for (uint32_t c = 0; c < k; ++c) {
+    if (counts[c] < 2) continue;
+    const auto& cent = centroids[c];
+    std::sort(order.begin() + starts[c], order.begin() + starts[c] + counts[c],
+              [&](uint32_t a, uint32_t b) {
+                return dist_to_centroid(vecs.data() + size_t(a) * IVF_DIMS, cent)
+                     < dist_to_centroid(vecs.data() + size_t(b) * IVF_DIMS, cent);
+              });
+  }
+
   std::vector<int16_t> qcentroids(size_t(k) * IVF_DIMS);
   for (uint32_t c = 0; c < k; ++c)
     for (int d = 0; d < IVF_DIMS; ++d)

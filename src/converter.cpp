@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -46,6 +47,68 @@ static uint32_t nearest_centroid(
     }
   }
   return best;
+}
+
+static std::pair<uint32_t, uint32_t> nearest2_centroid(
+    const int16_t *p,
+    const std::vector<std::array<float, IVF_DIMS>> &centroids) {
+  const uint32_t k = (uint32_t)centroids.size();
+  if (k == 1) return {0, 0};
+  uint32_t best = 0, second = 1;
+  float best_d = dist_to_centroid(p, centroids[0]);
+  float second_d = dist_to_centroid(p, centroids[1]);
+  if (second_d < best_d) {
+    std::swap(best, second);
+    std::swap(best_d, second_d);
+  }
+  for (uint32_t c = 2; c < k; ++c) {
+    float d = dist_to_centroid(p, centroids[c]);
+    if (d < best_d) {
+      second = best;
+      second_d = best_d;
+      best = c;
+      best_d = d;
+    } else if (d < second_d) {
+      second = c;
+      second_d = d;
+    }
+  }
+  return {best, second};
+}
+
+static void print_histogram(const std::vector<uint32_t> &counts) {
+  const uint32_t k = (uint32_t)counts.size();
+  uint32_t mn = UINT32_MAX, mx = 0;
+  uint64_t total = 0;
+  for (auto c : counts) {
+    if (c < mn) mn = c;
+    if (c > mx) mx = c;
+    total += c;
+  }
+  double avg = (double)total / k;
+  fprintf(stderr, "Cluster size: min=%u max=%u avg=%.1f (k=%u n=%llu)\n",
+          mn, mx, avg, k, (unsigned long long)total);
+
+  static constexpr int NBUCKETS = 20;
+  static constexpr int BAR_W = 40;
+  int buckets[NBUCKETS] = {};
+  for (auto c : counts) {
+    int b = mx > 0 ? (int)((uint64_t)c * NBUCKETS / ((uint64_t)mx + 1)) : 0;
+    if (b >= NBUCKETS) b = NBUCKETS - 1;
+    ++buckets[b];
+  }
+  int max_b = *std::max_element(buckets, buckets + NBUCKETS);
+  for (int b = 0; b < NBUCKETS; ++b) {
+    uint32_t lo = (uint32_t)((uint64_t)b * (mx + 1) / NBUCKETS);
+    uint32_t hi = (uint32_t)((uint64_t)(b + 1) * (mx + 1) / NBUCKETS) - 1;
+    int bar = max_b > 0 ? buckets[b] * BAR_W / max_b : 0;
+    char bar_str[BAR_W + 1];
+    memset(bar_str, '#', bar);
+    memset(bar_str + bar, ' ', BAR_W - bar);
+    bar_str[BAR_W] = '\0';
+    fprintf(stderr, "  %5u-%5u | %s %d\n", lo, hi, bar_str, buckets[b]);
+  }
+  fprintf(stderr, "\n");
 }
 
 // ── K-means++ init
@@ -98,13 +161,14 @@ static std::vector<std::array<float, IVF_DIMS>> init_kmeans_pp(
 // ── K-means training
 // ──────────────────────────────────────────────────────────
 
-static void train_kmeans(const std::vector<int16_t> &vecs,
-                         const std::vector<uint32_t> &sample,
-                         std::vector<std::array<float, IVF_DIMS>> &centroids,
-                         int iters) {
+static int train_kmeans(const std::vector<int16_t> &vecs,
+                        const std::vector<uint32_t> &sample,
+                        std::vector<std::array<float, IVF_DIMS>> &centroids,
+                        int iters) {
   const uint32_t k = (uint32_t)centroids.size();
   std::vector<uint32_t> assign(sample.size(), 0);
   std::mt19937_64 rng(0xC0FFEE);
+  int actual_iters = iters;
 
   for (int iter = 0; iter < iters; ++iter) {
     uint64_t changed = 0;
@@ -141,8 +205,9 @@ static void train_kmeans(const std::vector<int16_t> &vecs,
     }
     std::cerr << "  iter " << (iter + 1) << "/" << iters
               << " changed=" << changed << "\n";
-    if (changed == 0) break;
+    if (changed == 0) { actual_iters = iter + 1; break; }
   }
+  return actual_iters;
 }
 
 // ── IVF build helper
@@ -163,19 +228,42 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
             << ", sample=" << actual_sample << ")...\n";
   auto centroids = init_kmeans_pp(vecs, sample, k, 42);
   std::cerr << "Training...\n";
-  train_kmeans(vecs, sample, centroids, iters);
+  int actual_iters = train_kmeans(vecs, sample, centroids, iters);
 
-  std::cerr << "Assigning " << n << " vectors...\n";
+  std::cerr << "Assigning " << n << " vectors (top-2)...\n";
   std::vector<uint32_t> assignment(n);
+  std::vector<uint32_t> alt(n);
   std::vector<uint32_t> counts(k, 0);
   for (uint32_t i = 0; i < n; ++i) {
-    uint32_t c =
-        nearest_centroid(vecs.data() + size_t(i) * IVF_DIMS, centroids);
-    assignment[i] = c;
-    ++counts[c];
+    auto [c1, c2] = nearest2_centroid(vecs.data() + size_t(i) * IVF_DIMS, centroids);
+    assignment[i] = c1;
+    alt[i] = c2;
+    ++counts[c1];
     if (i % 500000 == 0 && i > 0)
       std::cerr << "  assigned " << i << "/" << n << "\n";
   }
+
+  // Balance pass: move excess vectors to their 2nd nearest centroid.
+  // max_cap = 3× average, minimum avg+10 for small k.
+  {
+    const uint32_t avg_cnt = n / std::max(k, 1u);
+    const uint32_t max_cap = std::max(avg_cnt * 3 + 1, avg_cnt + 10);
+    std::cerr << "Balance pass (avg=" << avg_cnt << " max_cap=" << max_cap << ")...\n";
+    uint64_t moved = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint32_t c1 = assignment[i];
+      uint32_t c2 = alt[i];
+      if (counts[c1] > max_cap && counts[c2] < max_cap) {
+        --counts[c1];
+        ++counts[c2];
+        assignment[i] = c2;
+        ++moved;
+      }
+    }
+    std::cerr << "  moved " << moved << " vectors\n";
+  }
+
+  print_histogram(counts);
 
   std::vector<uint32_t> block_offsets(k + 1, 0);
   for (uint32_t c = 0; c < k; ++c)
@@ -250,6 +338,8 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
   hdr.total_blocks = total_blocks;
   hdr.block_size = IVF_BLOCK;
   hdr.dims = IVF_DIMS;
+  hdr.train_sample = actual_sample;
+  hdr.train_iters = (uint32_t)actual_iters;
 
   const IndexLayout layout = layout_for(k, total_blocks);
 

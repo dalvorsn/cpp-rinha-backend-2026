@@ -71,7 +71,7 @@ class IVF {
     free(bpsoa_max);
   }
 
-  static constexpr int MAX_NPROBE = 16;
+  static constexpr int MAX_NPROBE = 64;
 
   int get_fraud_count(const int16_t* q, bool* did_repair = nullptr) const {
     // Compute vq pairs once — shared by find_top_centroids, scan_cluster,
@@ -102,6 +102,16 @@ class IVF {
 
     return cnt;
   }
+
+  uint32_t get_n() const { return n; }
+  uint32_t get_k() const { return k; }
+  uint32_t get_train_sample() const {
+    return ((const IndexHeader*)file_data)->train_sample;
+  }
+  uint32_t get_train_iters() const {
+    return ((const IndexHeader*)file_data)->train_iters;
+  }
+  const uint32_t* cluster_counts() const { return counts; }
 
  private:
   void* file_data = nullptr;

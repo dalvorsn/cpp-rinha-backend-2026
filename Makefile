@@ -4,7 +4,7 @@ TIDY   = clang-tidy-19
 SRCS := $(shell find src -name "*.cpp")
 HDRS := $(shell find src -name "*.hpp")
 
-.PHONY: all build run run-apm down convert cmake lint lint-fix format install-deps clean prune
+.PHONY: all build run run-apm down convert cmake bench lint lint-fix format install-deps clean prune
 
 all: build
 
@@ -19,6 +19,10 @@ run-apm:
 
 down:
 	docker compose down
+
+bench:
+	docker compose -f bench/docker-compose.yml up --build --abort-on-container-exit
+	docker compose -f bench/docker-compose.yml down
 
 convert:
 	@cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON

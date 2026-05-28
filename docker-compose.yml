@@ -30,6 +30,7 @@ services:
   api1:
     <<: *api-common
     container_name: api1
+    cpuset: "0"
     environment:
       <<: *api-env
       API_CTRL: /run/sock/api1.ctrl
@@ -37,6 +38,7 @@ services:
   api2:
     <<: *api-common
     container_name: api2
+    cpuset: "1"
     environment:
       <<: *api-env
       API_CTRL: /run/sock/api2.ctrl
@@ -45,6 +47,7 @@ services:
     image: dalvorsn/rinha-backend-2026:main
     pull_policy: always
     container_name: lb
+    cpuset: "2,3"
     depends_on:
       - api1
       - api2

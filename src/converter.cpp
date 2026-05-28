@@ -12,8 +12,8 @@
 #include "types.hpp"
 
 static constexpr uint32_t DEFAULT_K = 4096;
-static constexpr uint32_t DEFAULT_SAMPLE = 50000;
-static constexpr int DEFAULT_ITERS = 50;
+static constexpr uint32_t DEFAULT_SAMPLE = 200000;
+static constexpr int DEFAULT_ITERS = 100;
 
 static inline int16_t quantize(double v) {
   if (v < -1.0) v = -1.0;
@@ -340,6 +340,7 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
   hdr.dims = IVF_DIMS;
   hdr.train_sample = actual_sample;
   hdr.train_iters = (uint32_t)actual_iters;
+  hdr.train_max_iters = (uint32_t)iters;
 
   const IndexLayout layout = layout_for(k, total_blocks);
 

@@ -67,7 +67,7 @@ struct Result {
 
 // ── Index stats ───────────────────────────────────────────────────────────────
 struct IndexStats {
-    uint32_t n, k, train_sample, train_iters;
+    uint32_t n, k, train_sample, train_iters, train_max_iters;
     std::vector<uint32_t> counts;
 };
 
@@ -304,7 +304,9 @@ static void write_markdown(const char* path, const CpuInfo& cpu,
     fprintf(md, "| **n** | %u |\n", idx.n);
     fprintf(md, "| **k** | %u |\n", idx.k);
     fprintf(md, "| **train_sample** | %u |\n", idx.train_sample);
-    fprintf(md, "| **train_iters** | %u |\n\n", idx.train_iters);
+    fprintf(md, "| **train_iters** | %u/%u%s |\n\n",
+            idx.train_iters, idx.train_max_iters,
+            idx.train_iters < idx.train_max_iters ? " (converged)" : "");
 
     {
         uint32_t mn = UINT32_MAX, mx = 0;
@@ -408,6 +410,7 @@ int main(int argc, char* argv[]) {
         idx.k = probe.get_k();
         idx.train_sample = probe.get_train_sample();
         idx.train_iters = probe.get_train_iters();
+        idx.train_max_iters = probe.get_train_max_iters();
         const uint32_t* cc = probe.cluster_counts();
         idx.counts.assign(cc, cc + idx.k);
     }

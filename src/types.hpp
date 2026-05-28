@@ -16,9 +16,10 @@ struct alignas(64) IndexHeader {
   uint32_t total_blocks;  // total Block8s across all clusters
   uint32_t block_size;    // always IVF_BLOCK
   uint32_t dims;          // always IVF_DIMS
-  uint32_t train_sample;  // k-means training sample size
-  uint32_t train_iters;   // actual k-means iterations that ran
-  uint32_t reserved[6];
+  uint32_t train_sample;     // k-means training sample size
+  uint32_t train_iters;      // actual k-means iterations that ran
+  uint32_t train_max_iters;  // configured max iterations
+  uint32_t reserved[5];
 };
 static_assert(sizeof(IndexHeader) == 64);
 

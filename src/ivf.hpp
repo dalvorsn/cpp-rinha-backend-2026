@@ -111,6 +111,9 @@ class IVF {
   uint32_t get_train_iters() const {
     return ((const IndexHeader*)file_data)->train_iters;
   }
+  uint32_t get_train_max_iters() const {
+    return ((const IndexHeader*)file_data)->train_max_iters;
+  }
   const uint32_t* cluster_counts() const { return counts; }
 
  private:

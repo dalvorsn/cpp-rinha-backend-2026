@@ -12,10 +12,14 @@ COPY . .
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release && \
     cmake --build build -j$(nproc) --target bench converter
 
-RUN if [ -f resources/references.json.gz ]; then \
-        gunzip -c resources/references.json.gz > resources/references.json; \
-    fi && \
-    ./build/converter resources/references.json resources/references.bin
+RUN if [ -f resources/references.bin ]; then \
+        echo "Using pre-built references.bin"; \
+    else \
+        if [ -f resources/references.json.gz ]; then \
+            gunzip -c resources/references.json.gz > resources/references.json; \
+        fi && \
+        ./build/converter resources/references.json resources/references.bin; \
+    fi
 
 FROM debian:trixie-slim
 

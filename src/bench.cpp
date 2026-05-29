@@ -25,29 +25,24 @@ struct Config {
 };
 
 static Config CONFIGS[] = {
-    // no repair — baseline to find minimum nprobe for perfect accuracy
-    {"nr_nprobe4",   4,  NO_REPAIR, 0},
-    {"nr_nprobe8",   8,  NO_REPAIR, 0},
-    {"nr_nprobe12", 12,  NO_REPAIR, 0},
-    {"nr_nprobe16", 16,  NO_REPAIR, 0},
-    {"nr_nprobe24", 24,  NO_REPAIR, 0},
-    {"nr_nprobe32", 32,  NO_REPAIR, 0},
-    {"nr_nprobe48", 48,  NO_REPAIR, 0},
-    {"nr_nprobe64", 64,  NO_REPAIR, 0},
     // repair 1..4
-    {"r14_nprobe4",   4,  1, 4},
-    {"r14_nprobe8",   8,  1, 4},
-    {"r14_nprobe12", 12,  1, 4},
-    {"r14_nprobe16", 16,  1, 4},
-    {"r14_nprobe24", 24,  1, 4},
-    {"r14_nprobe32", 32,  1, 4},
+    {"r14_nprobe1",    1,  1, 4},
+    {"r14_nprobe2",    2,  1, 4},
+    {"r14_nprobe4",    4,  1, 4},
+    {"r14_nprobe8",    8,  1, 4},
+    {"r14_nprobe12",  12,  1, 4},
+    {"r14_nprobe16",  16,  1, 4},
+    {"r14_nprobe24",  24,  1, 4},
+    {"r14_nprobe32",  32,  1, 4},
     // repair 2..3
-    {"r23_nprobe4",   4,  2, 3},
-    {"r23_nprobe8",   8,  2, 3},
-    {"r23_nprobe12", 12,  2, 3},
-    {"r23_nprobe16", 16,  2, 3},
-    {"r23_nprobe24", 24,  2, 3},
-    {"r23_nprobe32", 32,  2, 3},
+    {"r14_nprobe1",    1,  2, 3},
+    {"r14_nprobe2",    2,  2, 3},
+    {"r23_nprobe4",    4,  2, 3},
+    {"r23_nprobe8",    8,  2, 3},
+    {"r23_nprobe12",  12,  2, 3},
+    {"r23_nprobe16",  16,  2, 3},
+    {"r23_nprobe24",  24,  2, 3},
+    {"r23_nprobe32",  32,  2, 3},
 };
 static constexpr int N_CONFIGS = (int)(sizeof(CONFIGS) / sizeof(CONFIGS[0]));
 
@@ -348,35 +343,48 @@ static void write_markdown(const char* path, const CpuInfo& cpu,
         fprintf(md, "]\n```\n\n");
     }
 
-    // Results
+    // Results — find best perfect config (fp==0, fn==0, lowest p99)
+    int best_idx = -1;
+    double best_p99 = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < (int)results.size(); ++i)
+        if (results[i].fp == 0 && results[i].fn == 0 && results[i].p99_us < best_p99) {
+            best_p99 = results[i].p99_us;
+            best_idx = i;
+        }
+
     fprintf(md, "## Results\n\n");
     fprintf(md, "> `approved = fraud_neighbors / 5 < 0.6` — threshold is fixed by the server.\n\n");
     fprintf(md, "| NPROBE | R.MIN | R.MAX | avg (µs) | p50 (µs) | p99 (µs) | max (µs) | TP | TN | FP | FN | FP%% | FN%% |\n");
     fprintf(md, "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
-    for (const auto& r : results) {
+    for (int ri = 0; ri < (int)results.size(); ++ri) {
+        const auto& r = results[ri];
         double fp_pct = r.total > 0 ? r.fp * 100.0 / r.total : 0;
         double fn_pct = r.total > 0 ? r.fn * 100.0 / r.total : 0;
-        bool perfect = (r.fp == 0 && r.fn == 0);
-        const char* b = perfect ? "**" : "";
+        bool perfect  = (r.fp == 0 && r.fn == 0);
+        bool is_best  = (ri == best_idx);
+        const char* bp = is_best ? "<span style=\"color:limegreen\">**"
+                       : perfect ? "**" : "";
+        const char* bs = is_best ? "**</span>"
+                       : perfect ? "**" : "";
         bool no_repair = r.cfg.repair_min > 5;
         if (no_repair) {
             fprintf(md,
                 "| %s%d%s | %s—%s | %s—%s"
                 " | %s%.2f%s | %s%.2f%s | %s%.2f%s | %s%.1f%s"
                 " | %s%d%s | %s%d%s | %s%d%s | %s%d%s | %s%.2f%%%s | %s%.2f%%%s |\n",
-                b, r.cfg.nprobe, b, b, b, b, b,
-                b, r.avg_us, b, b, r.p50_us, b, b, r.p99_us, b, b, r.max_us, b,
-                b, r.tp, b, b, r.tn, b, b, r.fp, b, b, r.fn, b,
-                b, fp_pct, b, b, fn_pct, b);
+                bp, r.cfg.nprobe, bs, bp, bs, bp, bs,
+                bp, r.avg_us, bs, bp, r.p50_us, bs, bp, r.p99_us, bs, bp, r.max_us, bs,
+                bp, r.tp, bs, bp, r.tn, bs, bp, r.fp, bs, bp, r.fn, bs,
+                bp, fp_pct, bs, bp, fn_pct, bs);
         } else {
             fprintf(md,
                 "| %s%d%s | %s%d%s | %s%d%s"
                 " | %s%.2f%s | %s%.2f%s | %s%.2f%s | %s%.1f%s"
                 " | %s%d%s | %s%d%s | %s%d%s | %s%d%s | %s%.2f%%%s | %s%.2f%%%s |\n",
-                b, r.cfg.nprobe, b, b, r.cfg.repair_min, b, b, r.cfg.repair_max, b,
-                b, r.avg_us, b, b, r.p50_us, b, b, r.p99_us, b, b, r.max_us, b,
-                b, r.tp, b, b, r.tn, b, b, r.fp, b, b, r.fn, b,
-                b, fp_pct, b, b, fn_pct, b);
+                bp, r.cfg.nprobe, bs, bp, r.cfg.repair_min, bs, bp, r.cfg.repair_max, bs,
+                bp, r.avg_us, bs, bp, r.p50_us, bs, bp, r.p99_us, bs, bp, r.max_us, bs,
+                bp, r.tp, bs, bp, r.tn, bs, bp, r.fp, bs, bp, r.fn, bs,
+                bp, fp_pct, bs, bp, fn_pct, bs);
         }
     }
 

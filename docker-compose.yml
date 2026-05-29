@@ -20,7 +20,8 @@ x-api-env: &api-env
   API_MCC_RISK: resources/mcc_risk.json
   API_REPAIR_MIN: "1"
   API_REPAIR_MAX: "4"
-  API_NPROBE: "12"
+  API_NPROBE: "1"
+  API_NPROBE_BORDER: "12"
   API_BUSY_POLL_US: "50"
   API_BUSY_POLL_BUDGET: "8"
   API_PREFER_BUSY_POLL: "1"
@@ -30,6 +31,7 @@ services:
   api1:
     <<: *api-common
     container_name: api1
+    cpuset: "0"
     environment:
       <<: *api-env
       API_CTRL: /run/sock/api1.ctrl
@@ -38,6 +40,7 @@ services:
   api2:
     <<: *api-common
     container_name: api2
+    cpuset: "1"
     environment:
       <<: *api-env
       API_CTRL: /run/sock/api2.ctrl
@@ -47,6 +50,7 @@ services:
     build:
       context: .
     container_name: lb
+    cpuset: "2,3"
     depends_on:
       - api1
       - api2

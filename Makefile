@@ -43,13 +43,13 @@ lint:
 	@if [ ! -f build/compile_commands.json ]; then \
 		cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; \
 	fi
-	@$(TIDY) $(SRCS) -p build -- -std=c++23
+	@$(TIDY) $(SRCS) $(HDRS) -p build -- -std=c++23
 
 lint-fix:
 	@if [ ! -f build/compile_commands.json ]; then \
 		cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; \
 	fi
-	@$(TIDY) $(SRCS) -p build -fix -fix-errors -- -std=c++23
+	@$(TIDY) $(SRCS) $(HDRS) -p build -fix -fix-errors -- -std=c++23
 
 install-deps:
 	@sudo apt-get update && sudo apt-get install -y \
@@ -57,6 +57,8 @@ install-deps:
 		cmake \
 		git \
 		gzip \
+		libgomp1 \
+		libomp-dev \
 		clang-19 \
 		clang-format-19 \
 		clang-tidy-19

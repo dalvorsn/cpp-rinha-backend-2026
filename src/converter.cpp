@@ -1,10 +1,11 @@
+#include <immintrin.h>
+#include <omp.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <immintrin.h>
-#include <omp.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -14,7 +15,7 @@
 #include "types.hpp"
 
 static constexpr uint32_t DEFAULT_K = 4096;
-static constexpr uint32_t DEFAULT_SAMPLE = 50000;  // full dataset
+static constexpr uint32_t DEFAULT_SAMPLE = 200000;
 static constexpr int DEFAULT_ITERS = 1000;
 
 static inline int16_t quantize(double v) {
@@ -51,8 +52,8 @@ static std::vector<float> build_csoa(
 
 // Nearest centroid via AVX2: processes 8 centroids per cycle.
 // qf must be float[IVF_DIMS], csoa from build_csoa().
-static uint32_t nearest_centroid_simd(
-    const float *qf, const float *csoa, uint32_t k) {
+static uint32_t nearest_centroid_simd(const float *qf, const float *csoa,
+                                      uint32_t k) {
   const uint32_t k_pad = (k + 7u) & ~7u;
   uint32_t best = 0;
   float best_d = std::numeric_limits<float>::infinity();
@@ -68,14 +69,18 @@ static uint32_t nearest_centroid_simd(
     _mm256_storeu_ps(vals, acc);
     const uint32_t lim = std::min(8u, k - c);
     for (uint32_t i = 0; i < lim; ++i)
-      if (vals[i] < best_d) { best_d = vals[i]; best = c + i; }
+      if (vals[i] < best_d) {
+        best_d = vals[i];
+        best = c + i;
+      }
   }
   return best;
 }
 
 // Top-2 nearest centroids via AVX2.
-static std::pair<uint32_t, uint32_t> nearest2_centroid_simd(
-    const float *qf, const float *csoa, uint32_t k) {
+static std::pair<uint32_t, uint32_t> nearest2_centroid_simd(const float *qf,
+                                                            const float *csoa,
+                                                            uint32_t k) {
   if (k == 1) return {0, 0};
   const uint32_t k_pad = (k + 7u) & ~7u;
   uint32_t best = 0, second = 1;
@@ -94,8 +99,15 @@ static std::pair<uint32_t, uint32_t> nearest2_centroid_simd(
     const uint32_t lim = std::min(8u, k - c);
     for (uint32_t i = 0; i < lim; ++i) {
       const float d = vals[i];
-      if (d < best_d) { second = best; second_d = best_d; best = c+i; best_d = d; }
-      else if (d < second_d) { second = c+i; second_d = d; }
+      if (d < best_d) {
+        second = best;
+        second_d = best_d;
+        best = c + i;
+        best_d = d;
+      } else if (d < second_d) {
+        second = c + i;
+        second_d = d;
+      }
     }
   }
   return {best, second};
@@ -111,8 +123,8 @@ static void print_histogram(const std::vector<uint32_t> &counts) {
     total += c;
   }
   double avg = (double)total / k;
-  fprintf(stderr, "Cluster size: min=%u max=%u avg=%.1f (k=%u n=%llu)\n",
-          mn, mx, avg, k, (unsigned long long)total);
+  fprintf(stderr, "Cluster size: min=%u max=%u avg=%.1f (k=%u n=%llu)\n", mn,
+          mx, avg, k, (unsigned long long)total);
 
   static constexpr int NBUCKETS = 20;
   static constexpr int BAR_W = 40;
@@ -154,7 +166,7 @@ static std::vector<std::array<float, IVF_DIMS>> init_kmeans_pp(
   for (uint32_t c = 1; c < k; ++c) {
     const auto &prev = centroids[c - 1];
     double sum = 0;
-    #pragma omp parallel for schedule(static) reduction(+:sum)
+#pragma omp parallel for schedule(static) reduction(+ : sum)
     for (size_t i = 0; i < sample.size(); ++i) {
       float dist =
           dist_to_centroid(vecs.data() + size_t(sample[i]) * IVF_DIMS, prev);
@@ -201,10 +213,10 @@ static int train_kmeans(const std::vector<int16_t> &vecs,
   const uint32_t k_pad = (k + 7u) & ~7u;
 
   // Pre-allocated reusable buffers
-  std::vector<float>    csoa(size_t(IVF_DIMS) * k_pad, 0.0f);
-  std::vector<double>   tsums(size_t(nthreads) * k * IVF_DIMS);
+  std::vector<float> csoa(size_t(IVF_DIMS) * k_pad, 0.0f);
+  std::vector<double> tsums(size_t(nthreads) * k * IVF_DIMS);
   std::vector<uint32_t> tcounts(size_t(nthreads) * k);
-  std::vector<double>   sums(size_t(k) * IVF_DIMS);
+  std::vector<double> sums(size_t(k) * IVF_DIMS);
   std::vector<uint32_t> counts(k);
 
   std::uniform_int_distribution<size_t> pick(0, ns - 1);
@@ -217,27 +229,30 @@ static int train_kmeans(const std::vector<int16_t> &vecs,
 
     // E-step: parallel SIMD nearest centroid
     uint64_t changed = 0;
-    #pragma omp parallel for schedule(static) reduction(+:changed)
+#pragma omp parallel for schedule(static) reduction(+ : changed)
     for (size_t i = 0; i < ns; ++i) {
       float qf[IVF_DIMS];
       const int16_t *p = vecs.data() + size_t(sample[i]) * IVF_DIMS;
       for (int d = 0; d < IVF_DIMS; ++d) qf[d] = float(p[d]);
       const uint32_t c = nearest_centroid_simd(qf, csoa.data(), k);
-      if (c != assign[i]) { ++changed; assign[i] = c; }
+      if (c != assign[i]) {
+        ++changed;
+        assign[i] = c;
+      }
     }
 
     // M-step: thread-local accumulators to avoid false sharing
-    std::fill(tsums.begin(),   tsums.end(),   0.0);
+    std::fill(tsums.begin(), tsums.end(), 0.0);
     std::fill(tcounts.begin(), tcounts.end(), 0u);
-    #pragma omp parallel
+#pragma omp parallel
     {
       const int tid = omp_get_thread_num();
-      double   *my_sums   = tsums.data()   + size_t(tid) * k * IVF_DIMS;
+      double *my_sums = tsums.data() + size_t(tid) * k * IVF_DIMS;
       uint32_t *my_counts = tcounts.data() + size_t(tid) * k;
-      #pragma omp for schedule(static) nowait
+#pragma omp for schedule(static) nowait
       for (size_t i = 0; i < ns; ++i) {
-        const uint32_t c  = assign[i];
-        const int16_t  *p = vecs.data() + size_t(sample[i]) * IVF_DIMS;
+        const uint32_t c = assign[i];
+        const int16_t *p = vecs.data() + size_t(sample[i]) * IVF_DIMS;
         ++my_counts[c];
         double *row = my_sums + size_t(c) * IVF_DIMS;
         for (int d = 0; d < IVF_DIMS; ++d) row[d] += p[d];
@@ -245,13 +260,13 @@ static int train_kmeans(const std::vector<int16_t> &vecs,
     }
 
     // Merge thread-local into global
-    std::fill(sums.begin(),   sums.end(),   0.0);
+    std::fill(sums.begin(), sums.end(), 0.0);
     std::fill(counts.begin(), counts.end(), 0u);
     for (int t = 0; t < nthreads; ++t) {
       for (uint32_t c = 0; c < k; ++c) {
         counts[c] += tcounts[size_t(t) * k + c];
-        double       *dst = sums.data()   + size_t(c) * IVF_DIMS;
-        const double *src = tsums.data()  + (size_t(t) * k + c) * IVF_DIMS;
+        double *dst = sums.data() + size_t(c) * IVF_DIMS;
+        const double *src = tsums.data() + (size_t(t) * k + c) * IVF_DIMS;
         for (int d = 0; d < IVF_DIMS; ++d) dst[d] += src[d];
       }
     }
@@ -262,15 +277,19 @@ static int train_kmeans(const std::vector<int16_t> &vecs,
         const int16_t *p = vecs.data() + size_t(sample[pick(rng)]) * IVF_DIMS;
         for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(p[d]);
       } else {
-        const double  inv = 1.0 / counts[c];
+        const double inv = 1.0 / counts[c];
         const double *row = sums.data() + size_t(c) * IVF_DIMS;
-        for (int d = 0; d < IVF_DIMS; ++d) centroids[c][d] = float(row[d] * inv);
+        for (int d = 0; d < IVF_DIMS; ++d)
+          centroids[c][d] = float(row[d] * inv);
       }
     }
 
     std::cerr << "  iter " << (iter + 1) << "/" << iters
               << " changed=" << changed << "\n";
-    if (changed == 0) { actual_iters = iter + 1; break; }
+    if (changed == 0) {
+      actual_iters = iter + 1;
+      break;
+    }
   }
   return actual_iters;
 }
@@ -300,7 +319,7 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
   std::vector<uint32_t> alt(n);
   {
     const auto csoa = build_csoa(centroids);
-    #pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static)
     for (uint32_t i = 0; i < n; ++i) {
       float qf[IVF_DIMS];
       const int16_t *p = vecs.data() + size_t(i) * IVF_DIMS;
@@ -318,7 +337,8 @@ static bool build_ivf(const std::vector<int16_t> &vecs,
   {
     const uint32_t avg_cnt = n / std::max(k, 1u);
     const uint32_t max_cap = std::max(avg_cnt * 3 + 1, avg_cnt + 10);
-    std::cerr << "Balance pass (avg=" << avg_cnt << " max_cap=" << max_cap << ")...\n";
+    std::cerr << "Balance pass (avg=" << avg_cnt << " max_cap=" << max_cap
+              << ")...\n";
     uint64_t moved = 0;
     for (uint32_t i = 0; i < n; ++i) {
       uint32_t c1 = assignment[i];

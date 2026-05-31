@@ -1,5 +1,5 @@
 x-api: &api-common
-  image: dalvorsn/rinha-backend-2026:warmup-and-huge-pages
+  image: dalvorsn/rinha-backend-2026:main
   pull_policy: always
   command: ./api_server
   volumes:
@@ -46,7 +46,7 @@ services:
       API_CTRL: /run/sock/api2.ctrl
 
   lb:
-    image: dalvorsn/rinha-backend-2026:warmup-and-huge-pages
+    image: dalvorsn/rinha-backend-2026:main
     pull_policy: always
     container_name: lb
     cpuset: "2,3"

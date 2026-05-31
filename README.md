@@ -37,11 +37,19 @@ At query time:
 
 ```mermaid
 flowchart TD
-    Q(["`query vec — 14 × int16`"]) --> CS
+    Q(["`query vec — 14 × int16`"]) --> BL
 
-    CS["`**1. Centroid search**
+    BL{"`**0. Borderline?**
+obvious legit or obvious fraud?`"}
+    BL -->|obvious| CS_FAST
+    BL -->|borderline| CS_SLOW
+
+    CS_FAST["`**1. Centroid search**
 AVX2 pair-SoA scan over k=4096 centroids
-→ NPROBE=12 nearest cluster IDs`"] --> SC
+→ NPROBE nearest cluster IDs`"] --> SC
+    CS_SLOW["`**1. Centroid search**
+AVX2 pair-SoA scan over k=4096 centroids
+→ NPROBE_BORDER nearest cluster IDs`"] --> SC
 
     SC["`**2. Cluster scan**
 scan blocks of 8 vectors with 7× madd_epi16
@@ -52,12 +60,13 @@ early prune after 6/14 and 10/14 dims`"] --> CHK
     CHK -->|yes — ambiguous| REP
 
     REP["`**3. Repair pass**
-scan remaining k−NPROBE clusters
-ordered by bbox lower bound (8 at a time via AVX2)
+scan remaining clusters ordered by bbox lower bound
+8 clusters at a time via AVX2
 early stop when result unambiguous`"] --> SCORE2(["`fraud_score = cnt / 5`"])
 ```
 
-1. **Centroid search** — find the `NPROBE` nearest cluster centroids using AVX2 distance accumulation over a prebuilt pair-SoA centroid table. Query pairs (`vq`) are computed once and reused across all three phases.
+0. **Borderline detection** — before probing, classify the transaction as *obvious* (clearly legit or clearly fraud) or *borderline*. Obvious transactions use the cheaper `NPROBE` probe count; borderline ones use the larger `NPROBE_BORDER`. A transaction is *obvious legit* if all hold: amount ≤ 500, amount/cust_avg ≤ 0.5, installments ≤ 3, tx_count_24h ≤ 5, km_home ≤ 50, safe MCC, known merchant. It is *obvious fraud* if all hold: amount ≥ 5000, installments ≥ 5, tx_count_24h ≥ 6, km_home ≥ 150, risky MCC, unknown merchant. Everything else is borderline (~21% of the test dataset).
+1. **Centroid search** — find the nearest cluster centroids using AVX2 distance accumulation over a prebuilt pair-SoA centroid table. Query pairs (`vq`) are computed once and reused across all three phases.
 2. **Cluster scan** — scan each selected cluster block-by-block with two partial prune checkpoints: after 6 of 14 dimensions and again after 10 of 14 dimensions, skip a block if all 8 lanes already exceed the current worst-of-top-5.
 3. **Repair pass** — if the top-5 result is mixed (1–4 fraud out of 5), the initial probes may have missed the true neighborhood. A second pass scans all remaining clusters ordered by their bbox lower bound, computed 8 clusters at a time via SIMD. Clusters already probed are skipped via a bitset. Scanning stops early once the result becomes unambiguous.
 
@@ -91,12 +100,13 @@ Each pair row = one `__m256i` load (16 × int16). 7 rows × 16 × 2 bytes = **22
 | Parameter | Value | Note |
 |---|---|---|
 | `k` (clusters) | 4096 | K-means cluster count used at build time |
-| `NPROBE` | 12 | Clusters probed per query |
+| `NPROBE` | 1 | Clusters probed for obvious legit/fraud transactions |
+| `NPROBE_BORDER` | 12 | Clusters probed for borderline transactions (~21% of load) |
 | Quantization scale | ×10000 | int16, range ±10000 |
 | Block size | 8 vectors | For AVX2 8-wide SIMD |
 | Repair condition | cnt ∈ [1, 4] | Triggers full index scan when result is ambiguous |
 
-With these settings the index achieves 6000/6000 recall at p99 ≈ 0.22 ms on the full reference dataset.
+With these settings the index achieves 6000/6000 recall (0 FP, 0 FN) at p99 ≈ 15 µs on the full test dataset (see [benchmark.md](benchmark.md) for full results).
 
 ## Feature normalization
 
@@ -125,7 +135,8 @@ Normalization constants (`max_amount`, `max_km`, etc.) are preloaded from `norma
 
 ## Repository layout
 
-- `src/converter.cpp` — reads `references.json[.gz]`, runs K-means, writes the binary IVF index
+- `src/converter.cpp` — reads `references.json[.gz]`, runs AVX2+OMP accelerated K-means (200k sample, top-2 assignment, balance pass), writes the binary IVF index
+- `src/bench.cpp` — offline benchmark: normalize + `get_fraud_count` directly against the full test dataset, no HTTP overhead
 - `src/server.cpp` — epoll HTTP server, parses requests, queries IVF, responds
 - `src/lb.cpp` — round-robin load balancer using SCM_RIGHTS fd passing
 - `src/ivf.hpp` — IVF index: layout, centroid SoA build, cluster scan, repair pass
@@ -145,12 +156,17 @@ Normalization constants (`max_amount`, `max_km`, etc.) are preloaded from `norma
 | `make run-apm` | Build and start with Prometheus + Grafana |
 | `make down` | Stop all containers |
 | `make prune` | Stop, remove images, volumes, and local build |
+| `make bench` | Run offline benchmark against the full test dataset |
+| `make k6` | Start server, run k6 load test with web dashboard, then stop |
 | `make cmake` | Local build via cmake (for development) |
 | `make convert` | Local build + convert `references.json` → `references.bin` |
 | `make format` | Format source with clang-format |
 | `make lint` | Lint source with clang-tidy |
+| `make lint-fix` | Lint and auto-apply fixes with clang-tidy |
+| `make install-deps` | Install build dependencies via apt |
+| `make clean` | Remove local build directory |
 
-Server configuration is via environment variables (see `docker-compose.yml`): `API_NPROBE`, `API_REPAIR_MIN`, `API_REPAIR_MAX`, `API_BUSY_POLL_US`, `API_EPOLL_TIMEOUT_MS`.
+Server configuration is via environment variables (see `docker-compose.yml`): `API_NPROBE`, `API_NPROBE_BORDER`, `API_REPAIR_MIN`, `API_REPAIR_MAX`, `API_BUSY_POLL_US`, `API_EPOLL_TIMEOUT_MS`.
 
 ## License
 

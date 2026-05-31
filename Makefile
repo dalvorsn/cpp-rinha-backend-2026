@@ -18,7 +18,12 @@ run-apm:
 	docker compose --profile monitoring up --build -d
 
 down:
-	docker compose down
+	docker compose --profile monitoring down
+
+k6:
+	make run
+	K6_WEB_DASHBOARD=true K6_WEB_DASHBOARD_OPEN=true k6 run test/test.js
+	make down
 
 bench:
 	docker compose -f bench/docker-compose.yml up --build --abort-on-container-exit

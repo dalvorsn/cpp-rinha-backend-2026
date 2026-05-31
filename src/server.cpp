@@ -427,13 +427,13 @@ int main(int argc, char* argv[]) {
   const char* epoll_to_str = getenv("API_EPOLL_TIMEOUT_MS");
 
   if (!ctrl_path || !refs_path || !norm_path || !mcc_path) {
-    fprintf(
-        stderr,
-        "Required env vars: API_CTRL API_REFERENCES "
-        "API_NORMALIZATION API_MCC_RISK\n"
-        "Optional: API_METRICS_PORT API_NPROBE API_NPROBE_BORDER API_REPAIR_MIN API_REPAIR_MAX\n"
-        "         API_BUSY_POLL_US API_BUSY_POLL_BUDGET\n"
-        "         API_PREFER_BUSY_POLL API_EPOLL_TIMEOUT_MS\n");
+    fprintf(stderr,
+            "Required env vars: API_CTRL API_REFERENCES "
+            "API_NORMALIZATION API_MCC_RISK\n"
+            "Optional: API_METRICS_PORT API_NPROBE API_NPROBE_BORDER "
+            "API_REPAIR_MIN API_REPAIR_MAX\n"
+            "         API_BUSY_POLL_US API_BUSY_POLL_BUDGET\n"
+            "         API_PREFER_BUSY_POLL API_EPOLL_TIMEOUT_MS\n");
     return 1;
   }
 
@@ -455,9 +455,11 @@ int main(int argc, char* argv[]) {
   apm.register_api_metrics();
 #endif
 
-  fprintf(stderr, "[INFO] loading IVF index: %s (nprobe=%d border=%d repair=[%d,%d])\n",
+  fprintf(stderr,
+          "[INFO] loading IVF index: %s (nprobe=%d border=%d repair=[%d,%d])\n",
           refs_path, g_nprobe, g_nprobe_border, g_repair_min, g_repair_max);
-  ivf = new IVF(refs_path, g_nprobe, g_repair_min, g_repair_max, g_nprobe_border);
+  ivf =
+      new IVF(refs_path, g_nprobe, g_repair_min, g_repair_max, g_nprobe_border);
   fprintf(stderr, "[INFO] IVF index loaded\n");
 
   mlockall(MCL_CURRENT);

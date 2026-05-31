@@ -19,9 +19,12 @@ else()
     message(STATUS "APM DISABLED")
 endif()
 
+find_package(OpenMP REQUIRED)
+
 # ── converter: build the IVF index at image-build time ───────────────────────
 add_executable(converter src/converter.cpp)
 target_include_directories(converter PRIVATE src)
+target_link_libraries(converter PRIVATE OpenMP::OpenMP_CXX)
 
 # ── lb: tiny SCM_RIGHTS load balancer (pure C) ───────────────────────────────
 add_executable(lb src/lb.cpp)
@@ -34,3 +37,7 @@ target_include_directories(lb PRIVATE src)
 add_executable(api_server src/server.cpp)
 target_link_libraries(api_server PRIVATE pthread)
 target_include_directories(api_server PRIVATE src)
+
+# ── bench: offline IVF benchmark across configs ───────────────────────────────
+add_executable(bench src/bench.cpp)
+target_include_directories(bench PRIVATE src)

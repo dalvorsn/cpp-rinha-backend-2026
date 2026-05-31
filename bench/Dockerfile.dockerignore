@@ -1,0 +1,9 @@
+*
+
+!src/
+!src/**
+!resources/
+!resources/**
+!test/test-data.json
+!CMakeLists.txt
+!.dockerignore

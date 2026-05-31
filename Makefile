@@ -4,7 +4,7 @@ TIDY   = clang-tidy-19
 SRCS := $(shell find src -name "*.cpp")
 HDRS := $(shell find src -name "*.hpp")
 
-.PHONY: all build run run-apm down convert cmake lint lint-fix format install-deps clean prune
+.PHONY: all build run run-apm down convert cmake bench lint lint-fix format install-deps clean prune
 
 all: build
 
@@ -18,7 +18,16 @@ run-apm:
 	docker compose --profile monitoring up --build -d
 
 down:
-	docker compose down
+	docker compose --profile monitoring down
+
+k6:
+	make run
+	K6_WEB_DASHBOARD=true K6_WEB_DASHBOARD_OPEN=true k6 run test/test.js
+	make down
+
+bench:
+	docker compose -f bench/docker-compose.yml up --build --abort-on-container-exit
+	docker compose -f bench/docker-compose.yml down
 
 convert:
 	@cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -39,13 +48,13 @@ lint:
 	@if [ ! -f build/compile_commands.json ]; then \
 		cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; \
 	fi
-	@$(TIDY) $(SRCS) -p build -- -std=c++23
+	@$(TIDY) $(SRCS) $(HDRS) -p build -- -std=c++23
 
 lint-fix:
 	@if [ ! -f build/compile_commands.json ]; then \
 		cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; \
 	fi
-	@$(TIDY) $(SRCS) -p build -fix -fix-errors -- -std=c++23
+	@$(TIDY) $(SRCS) $(HDRS) -p build -fix -fix-errors -- -std=c++23
 
 install-deps:
 	@sudo apt-get update && sudo apt-get install -y \
@@ -53,6 +62,8 @@ install-deps:
 		cmake \
 		git \
 		gzip \
+		libgomp1 \
+		libomp-dev \
 		clang-19 \
 		clang-format-19 \
 		clang-tidy-19

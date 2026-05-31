@@ -15,10 +15,11 @@
 class IVF {
  public:
   explicit IVF(const char* filename, int nprobe = 4, int repair_min = 2,
-               int repair_max = 3) {
+               int repair_max = 3, int nprobe_borderline = 0) {
     nprobe_ = nprobe;
     repair_min_ = repair_min;
     repair_max_ = repair_max;
+    nprobe_borderline_ = nprobe_borderline;
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
       perror("ivf open");
@@ -71,30 +72,34 @@ class IVF {
     free(bpsoa_max);
   }
 
-  static constexpr int MAX_NPROBE = 16;
+  static constexpr int MAX_NPROBE = 256;
+
+  static bool classify_borderline(const int16_t* q) { return is_borderline(q); }
 
   int get_fraud_count(const int16_t* q, bool* did_repair = nullptr) const {
-    // Compute vq pairs once — shared by find_top_centroids, scan_cluster,
-    // repair
     __m256i vq[IVF_PAIRS];
     for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
 
+    const int np = (nprobe_borderline_ > 0 && is_borderline(q))
+                       ? nprobe_borderline_
+                       : nprobe_;
+
     uint32_t probes[MAX_NPROBE];
-    find_top_centroids_vq(vq, probes, nprobe_);
+    find_top_centroids_vq(vq, probes, np);
 
     uint32_t top_dists[5] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
                              UINT32_MAX};
     uint8_t top_labels[5] = {};
     uint32_t max_top = UINT32_MAX;
 
-    for (int i = 0; i < nprobe_; i++)
+    for (int i = 0; i < np; i++)
       scan_cluster_vq(vq, probes[i], top_dists, top_labels, max_top);
 
     int cnt = 0;
     for (int i = 0; i < 5; i++) cnt += top_labels[i];
 
     if (cnt >= repair_min_ && cnt <= repair_max_) {
-      repair(vq, probes, nprobe_, top_dists, top_labels, max_top);
+      repair(vq, probes, np, top_dists, top_labels, max_top);
       cnt = 0;
       for (int i = 0; i < 5; i++) cnt += top_labels[i];
       if (did_repair) *did_repair = true;
@@ -103,6 +108,19 @@ class IVF {
     return cnt;
   }
 
+  uint32_t get_n() const { return n; }
+  uint32_t get_k() const { return k; }
+  uint32_t get_train_sample() const {
+    return ((const IndexHeader*)file_data)->train_sample;
+  }
+  uint32_t get_train_iters() const {
+    return ((const IndexHeader*)file_data)->train_iters;
+  }
+  uint32_t get_train_max_iters() const {
+    return ((const IndexHeader*)file_data)->train_max_iters;
+  }
+  const uint32_t* cluster_counts() const { return counts; }
+
  private:
   void* file_data = nullptr;
   size_t file_size = 0;
@@ -110,6 +128,7 @@ class IVF {
   int nprobe_ = 4;
   int repair_min_ = 2;
   int repair_max_ = 3;
+  int nprobe_borderline_ = 0;
 
   uint32_t n = 0;
   uint32_t k = 0;
@@ -132,6 +151,45 @@ class IVF {
   int16_t* bpsoa_min = nullptr;
   int16_t* bpsoa_max = nullptr;
   uint32_t n_groups = 0;
+
+  // Transaction is borderline when it is neither obviously legit nor obviously
+  // fraud — mirroring the tier_score logic from sl4ureano/rinha2026.
+  //
+  // int16 scale: value = round(normalized × 10000)
+  //   q[0]  = amount / 10000                  → 500→500, 5000→5000
+  //   q[1]  = installments / 12               → 3→2500, 5→4167
+  //   q[2]  = (amount/cust_avg) / 10          → ratio 0.5→500
+  //   q[7]  = km_home / 1000                  → 50→500, 150→1500
+  //   q[8]  = tx_count_24h / 20               → 5→2500, 6→3000
+  //   q[11] = unknown_merchant (0=known,10000=unknown)
+  //   q[12] = mcc_risk × 10000
+  //     safe MCCs:  5411→1500, 5812→3000, 5912→2000, 5311→2500
+  //     risky MCCs: 7995→8500, 7801→8000, 7802→7500
+  static bool is_borderline(const int16_t* q) {
+    // obvious_legit: ALL must hold
+    const bool safe_mcc =
+        (q[12] == 1500 || q[12] == 3000 || q[12] == 2000 || q[12] == 2500);
+    const bool obvious_legit = q[0] <= 500 &&           // amount ≤ 500
+                               q[2] <= 500 &&           // amount/cust_avg ≤ 0.5
+                               q[1] <= 2500 &&          // installments ≤ 3
+                               q[8] <= 2500 &&          // tx_count_24h ≤ 5
+                               q[7] <= 500 &&           // km_home ≤ 50
+                               safe_mcc && q[11] == 0;  // known merchant
+
+    if (obvious_legit) return false;
+
+    // obvious_fraud: ALL must hold
+    const bool risky_mcc = (q[12] == 8500 || q[12] == 8000 || q[12] == 7500);
+    const bool obvious_fraud = q[0] >= 5000 &&               // amount ≥ 5000
+                               q[1] >= 4167 &&               // installments ≥ 5
+                               q[8] >= 3000 &&               // tx_count_24h ≥ 6
+                               q[7] >= 1500 &&               // km_home ≥ 150
+                               risky_mcc && q[11] == 10000;  // unknown merchant
+
+    if (obvious_fraud) return false;
+
+    return true;
+  }
 
   // Broadcast [q[2p], q[2p+1]] × 8 as int16 packed into int32 lanes.
   // Works because int16 subtraction is bitwise-equivalent for signed values

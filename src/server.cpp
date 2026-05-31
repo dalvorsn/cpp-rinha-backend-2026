@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 #include "apm.hpp"
 #include "ivf.hpp"
@@ -83,6 +84,40 @@ struct Conn {
 
 static Conn* conns[MAX_FDS] = {};
 static IVF* ivf = nullptr;
+
+static void run_warmup(int ms) {
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  const uint64_t target_ns = (uint64_t)ms * 1000000ULL;
+
+  uint64_t rng = 0xDEADBEEFCAFEBABEULL;
+  uint64_t count = 0;
+  int16_t vec[IVF_DIMS];
+
+  for (;;) {
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const uint64_t elapsed = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+                             (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+    if (elapsed >= target_ns) break;
+
+    for (int i = 0; i < IVF_DIMS; i++) {
+      rng ^= rng << 13;
+      rng ^= rng >> 7;
+      rng ^= rng << 17;
+      vec[i] = (int16_t)((rng >> 16) % 10001);
+    }
+
+    bool repaired = false;
+    ivf->get_fraud_count(vec, &repaired);
+    count++;
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  const uint64_t elapsed_ms = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000ULL +
+                              (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000ULL;
+  fprintf(stderr, "[INFO] warmup: %llu queries in %llums\n",
+          (unsigned long long)count, (unsigned long long)elapsed_ms);
+}
 static Normalizer normalizer;
 static int g_repair_min = 2;
 static int g_repair_max = 3;
@@ -469,6 +504,15 @@ int main(int argc, char* argv[]) {
     return 1;
   }
   fprintf(stderr, "[INFO] normalizer loaded\n");
+
+  {
+    const char* wms_str = getenv("API_WARMUP_MS");
+    const int wms = wms_str ? atoi(wms_str) : 900;
+    if (wms > 0) {
+      fprintf(stderr, "[INFO] warming up for %dms...\n", wms);
+      run_warmup(wms);
+    }
+  }
 
   ctrl_listen_fd = create_ctrl_socket(ctrl_path);
   if (ctrl_listen_fd < 0) {

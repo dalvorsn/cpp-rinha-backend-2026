@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <immintrin.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -28,11 +29,15 @@ class IVF {
     struct stat st;
     fstat(fd, &st);
     file_size = (size_t)st.st_size;
-    file_data = malloc(file_size);
-    if (!file_data) {
-      perror("ivf malloc");
+    file_data = mmap(nullptr, file_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (file_data == MAP_FAILED) {
+      perror("ivf mmap");
       std::exit(1);
     }
+#ifdef MADV_HUGEPAGE
+    madvise(file_data, file_size, MADV_HUGEPAGE);
+#endif
 
     char* dst = (char*)file_data;
     size_t left = file_size;
@@ -66,7 +71,7 @@ class IVF {
   }
 
   ~IVF() {
-    free(file_data);
+    munmap(file_data, file_size);
     free(cpsoa);
     free(bpsoa_min);
     free(bpsoa_max);

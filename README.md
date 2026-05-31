@@ -166,7 +166,9 @@ Normalization constants (`max_amount`, `max_km`, etc.) are preloaded from `norma
 | `make install-deps` | Install build dependencies via apt |
 | `make clean` | Remove local build directory |
 
-Server configuration is via environment variables (see `docker-compose.yml`): `API_NPROBE`, `API_NPROBE_BORDER`, `API_REPAIR_MIN`, `API_REPAIR_MAX`, `API_BUSY_POLL_US`, `API_EPOLL_TIMEOUT_MS`.
+Server configuration is via environment variables (see `docker-compose.yml`): `API_NPROBE`, `API_NPROBE_BORDER`, `API_REPAIR_MIN`, `API_REPAIR_MAX`, `API_BUSY_POLL_US`, `API_EPOLL_TIMEOUT_MS`, `API_WARMUP_MS`.
+
+`API_WARMUP_MS` (default `900`) controls how long each `api_server` spends warming up before signalling readiness. During warmup, random synthetic vectors are fed through the full IVF search pipeline to populate the L2 cache with centroid data and train branch predictors. Set to `0` to disable.
 
 ## License
 

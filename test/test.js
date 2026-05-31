@@ -1,5 +1,5 @@
 import http from 'k6/http';
-import { check } from 'k6';
+import { sleep } from 'k6';
 import { SharedArray } from 'k6/data';
 import { Counter } from 'k6/metrics';
 import { textSummary } from './k6-summary.js';
@@ -42,6 +42,13 @@ export const options = {
 };
 
 export function setup() {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+        const res = http.get('http://localhost:9999/ready', { timeout: '500ms' });
+        if (res.status === 200) break;
+        sleep(0.2);
+    }
+
     console.log(
         `Dataset: ${expectedStats.total} entries, `
         + `${expectedStats.fraud_count} fraud (${expectedStats.fraud_rate}%), `

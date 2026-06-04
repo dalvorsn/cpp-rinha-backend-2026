@@ -15,20 +15,20 @@
 // get_fraud_count() / 5 < 0.6  →  cnt < 3  (hardcoded in server)
 static constexpr int FRAUD_THRESHOLD = 3;
 
-// repair_min > 5 is impossible (cnt ∈ 0..5) → repair never fires
-static constexpr int NO_REPAIR = 6;
-
 struct Config {
   int nprobe;
-  int nprobe_border;  // 0 = disabled; >0 = nprobe for borderline queries
+  int nprobe_border;
   int repair_min;
   int repair_max;
 };
 
 static Config CONFIGS[] = {
-    {8, 0, 1, 4},  {10, 0, 1, 4}, {12, 0, 1, 4},  {1, 12, 1, 4},  {2, 12, 1, 4},
-    {3, 12, 1, 4}, {4, 12, 1, 4}, {5, 12, 1, 4},  {6, 12, 1, 4},  {7, 12, 1, 4},
-    {8, 12, 1, 4}, {9, 12, 1, 4}, {10, 12, 1, 4}, {11, 12, 1, 4},
+    // nprobe_border=0: sem seleção por query borderline
+    {1, 0, 1, 4}, {2, 0, 1, 4}, {3, 0, 1, 4}, {4, 0, 1, 4},
+    // nprobe_border>0: nprobe menor pra obvios, maior pros borderline
+    {1, 4, 1, 4}, {1, 6, 1, 4}, {1, 8, 1, 4},
+    {2, 4, 1, 4}, {2, 6, 1, 4}, {2, 8, 1, 4},
+    {3, 4, 1, 4}, {3, 6, 1, 4},
 };
 static constexpr int N_CONFIGS = (int)(sizeof(CONFIGS) / sizeof(CONFIGS[0]));
 
@@ -409,18 +409,17 @@ static void write_markdown(const char* path, const CpuInfo& cpu,
                                : "";
     const char* bs = is_best ? "**</span>" : perfect ? "**" : "";
     char border_cell[8];
-    if (r.cfg.nprobe_border > 0)
-      snprintf(border_cell, 8, "%d", r.cfg.nprobe_border);
-    else
-      snprintf(border_cell, 8, "—");
+    if (r.cfg.nprobe_border > 0) snprintf(border_cell, 8, "%d", r.cfg.nprobe_border);
+    else                          snprintf(border_cell, 8, "—");
     fprintf(
         md,
         "| %s%d%s | %s%s%s | %s%d%s | %s%d%s"
         " | %s%.2f%s | %s%.2f%s | %s%.2f%s | %s%.1f%s"
         " | %s%d%s | %s%d%s | %s%d%s | %s%d%s | %s%.2f%%%s | %s%.2f%%%s |\n",
-        bp, r.cfg.nprobe, bs, bp, border_cell, bs, bp, r.cfg.repair_min, bs, bp,
-        r.cfg.repair_max, bs, bp, r.avg_us, bs, bp, r.p50_us, bs, bp, r.p99_us,
-        bs, bp, r.max_us, bs, bp, r.tp, bs, bp, r.tn, bs, bp, r.fp, bs, bp,
+        bp, r.cfg.nprobe, bs, bp, border_cell, bs,
+        bp, r.cfg.repair_min, bs, bp, r.cfg.repair_max, bs,
+        bp, r.avg_us, bs, bp, r.p50_us, bs, bp, r.p99_us, bs,
+        bp, r.max_us, bs, bp, r.tp, bs, bp, r.tn, bs, bp, r.fp, bs, bp,
         r.fn, bs, bp, fp_pct, bs, bp, fn_pct, bs);
   }
 
@@ -451,7 +450,7 @@ int main(int argc, char* argv[]) {
   // Load index stats before the config loop
   IndexStats idx;
   {
-    IVF probe(ivf_path, 1, NO_REPAIR, 0);
+    IVF probe(ivf_path, 1, 6, 6);  // repair_min > 5 → repair never fires
     idx.n = probe.get_n();
     idx.k = probe.get_k();
     idx.train_sample = probe.get_train_sample();
@@ -493,7 +492,7 @@ int main(int argc, char* argv[]) {
 
   int n_borderline = 0;
   for (size_t i = 0; i < entries.size(); ++i)
-    if (vecs[i][0] != 0 && IVF::classify_borderline(vecs[i].data()))
+    if (vecs[i][0] != 0 && is_borderline(vecs[i].data()))
       ++n_borderline;
   fprintf(stderr, "Borderline: %d/%zu (%.1f%%)\n\n", n_borderline,
           entries.size(), n_borderline * 100.0 / (double)entries.size());
@@ -502,15 +501,10 @@ int main(int argc, char* argv[]) {
 
   for (int ci = 0; ci < N_CONFIGS; ++ci) {
     const Config& cfg = CONFIGS[ci];
-    if (cfg.nprobe_border > 0)
-      fprintf(stderr, "=== nprobe=%d border=%d repair=%d-%d ===\n", cfg.nprobe,
-              cfg.nprobe_border, cfg.repair_min, cfg.repair_max);
-    else
-      fprintf(stderr, "=== nprobe=%d repair=%d-%d ===\n", cfg.nprobe,
-              cfg.repair_min, cfg.repair_max);
+    fprintf(stderr, "=== nprobe=%d border=%d repair=%d-%d ===\n",
+            cfg.nprobe, cfg.nprobe_border, cfg.repair_min, cfg.repair_max);
 
-    IVF ivf(ivf_path, cfg.nprobe, cfg.repair_min, cfg.repair_max,
-            cfg.nprobe_border);
+    IVF ivf(ivf_path, cfg.nprobe, cfg.repair_min, cfg.repair_max, cfg.nprobe_border);
 
     std::vector<uint64_t> latencies;
     latencies.reserve(entries.size());

@@ -452,7 +452,7 @@ int main(int argc, char* argv[]) {
   const char* refs_path = getenv("API_REFERENCES");
   const char* norm_path = getenv("API_NORMALIZATION");
   const char* mcc_path = getenv("API_MCC_RISK");
-  const char* nprobe_str = getenv("API_NPROBE");
+  const char* nprobe_str        = getenv("API_NPROBE");
   const char* nprobe_border_str = getenv("API_NPROBE_BORDER");
   const char* rmin_str = getenv("API_REPAIR_MIN");
   const char* rmax_str = getenv("API_REPAIR_MAX");
@@ -465,14 +465,13 @@ int main(int argc, char* argv[]) {
     fprintf(stderr,
             "Required env vars: API_CTRL API_REFERENCES "
             "API_NORMALIZATION API_MCC_RISK\n"
-            "Optional: API_METRICS_PORT API_NPROBE API_NPROBE_BORDER "
-            "API_REPAIR_MIN API_REPAIR_MAX\n"
+            "Optional: API_METRICS_PORT API_NPROBE API_REPAIR_MIN API_REPAIR_MAX\n"
             "         API_BUSY_POLL_US API_BUSY_POLL_BUDGET\n"
             "         API_PREFER_BUSY_POLL API_EPOLL_TIMEOUT_MS\n");
     return 1;
   }
 
-  int g_nprobe = nprobe_str ? atoi(nprobe_str) : 4;
+  int g_nprobe        = nprobe_str        ? atoi(nprobe_str)        : 4;
   int g_nprobe_border = nprobe_border_str ? atoi(nprobe_border_str) : 0;
   if (rmin_str) g_repair_min = atoi(rmin_str);
   if (rmax_str) g_repair_max = atoi(rmax_str);
@@ -493,8 +492,7 @@ int main(int argc, char* argv[]) {
   fprintf(stderr,
           "[INFO] loading IVF index: %s (nprobe=%d border=%d repair=[%d,%d])\n",
           refs_path, g_nprobe, g_nprobe_border, g_repair_min, g_repair_max);
-  ivf =
-      new IVF(refs_path, g_nprobe, g_repair_min, g_repair_max, g_nprobe_border);
+  ivf = new IVF(refs_path, g_nprobe, g_repair_min, g_repair_max, g_nprobe_border);
   fprintf(stderr, "[INFO] IVF index loaded\n");
 
   mlockall(MCL_CURRENT);

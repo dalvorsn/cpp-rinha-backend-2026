@@ -79,8 +79,6 @@ class IVF {
 
   static constexpr int MAX_NPROBE = 256;
 
-  static bool classify_borderline(const int16_t* q) { return is_borderline(q); }
-
   int get_fraud_count(const int16_t* q, bool* did_repair = nullptr) const {
     __m256i vq[IVF_PAIRS];
     for (int p = 0; p < IVF_PAIRS; p++) vq[p] = make_qpair(q, p);
@@ -100,16 +98,18 @@ class IVF {
     for (int i = 0; i < np; i++)
       scan_cluster_vq(vq, probes[i], top_dists, top_labels, max_top);
 
-    int cnt = 0;
-    for (int i = 0; i < 5; i++) cnt += top_labels[i];
+    // Trigger repair if any top-5 neighbor is borderline (label bit 1).
+    bool has_borderline = false;
+    for (int i = 0; i < 5; i++)
+      if (top_labels[i] & 2) { has_borderline = true; break; }
 
-    if (cnt >= repair_min_ && cnt <= repair_max_) {
+    if (has_borderline) {
       repair(vq, probes, np, top_dists, top_labels, max_top);
-      cnt = 0;
-      for (int i = 0; i < 5; i++) cnt += top_labels[i];
       if (did_repair) *did_repair = true;
     }
 
+    int cnt = 0;
+    for (int i = 0; i < 5; i++) cnt += (top_labels[i] & 1);
     return cnt;
   }
 
@@ -156,45 +156,6 @@ class IVF {
   int16_t* bpsoa_min = nullptr;
   int16_t* bpsoa_max = nullptr;
   uint32_t n_groups = 0;
-
-  // Transaction is borderline when it is neither obviously legit nor obviously
-  // fraud — mirroring the tier_score logic from sl4ureano/rinha2026.
-  //
-  // int16 scale: value = round(normalized × 10000)
-  //   q[0]  = amount / 10000                  → 500→500, 5000→5000
-  //   q[1]  = installments / 12               → 3→2500, 5→4167
-  //   q[2]  = (amount/cust_avg) / 10          → ratio 0.5→500
-  //   q[7]  = km_home / 1000                  → 50→500, 150→1500
-  //   q[8]  = tx_count_24h / 20               → 5→2500, 6→3000
-  //   q[11] = unknown_merchant (0=known,10000=unknown)
-  //   q[12] = mcc_risk × 10000
-  //     safe MCCs:  5411→1500, 5812→3000, 5912→2000, 5311→2500
-  //     risky MCCs: 7995→8500, 7801→8000, 7802→7500
-  static bool is_borderline(const int16_t* q) {
-    // obvious_legit: ALL must hold
-    const bool safe_mcc =
-        (q[12] == 1500 || q[12] == 3000 || q[12] == 2000 || q[12] == 2500);
-    const bool obvious_legit = q[0] <= 500 &&           // amount ≤ 500
-                               q[2] <= 500 &&           // amount/cust_avg ≤ 0.5
-                               q[1] <= 2500 &&          // installments ≤ 3
-                               q[8] <= 2500 &&          // tx_count_24h ≤ 5
-                               q[7] <= 500 &&           // km_home ≤ 50
-                               safe_mcc && q[11] == 0;  // known merchant
-
-    if (obvious_legit) return false;
-
-    // obvious_fraud: ALL must hold
-    const bool risky_mcc = (q[12] == 8500 || q[12] == 8000 || q[12] == 7500);
-    const bool obvious_fraud = q[0] >= 5000 &&               // amount ≥ 5000
-                               q[1] >= 4167 &&               // installments ≥ 5
-                               q[8] >= 3000 &&               // tx_count_24h ≥ 6
-                               q[7] >= 1500 &&               // km_home ≥ 150
-                               risky_mcc && q[11] == 10000;  // unknown merchant
-
-    if (obvious_fraud) return false;
-
-    return true;
-  }
 
   // Broadcast [q[2p], q[2p+1]] × 8 as int16 packed into int32 lanes.
   // Works because int16 subtraction is bitwise-equivalent for signed values
@@ -445,11 +406,14 @@ class IVF {
     for (int i = 0; i < ncands; i++) {
       if (cands[i].lb >= max_top) break;
       scan_cluster_vq(vq, cands[i].c, top_dists, top_labels, max_top);
-      // Early stop: if result is now unambiguous, scanning more clusters
-      // cannot change the approved/denied decision.
-      int cnt_now = top_labels[0] + top_labels[1] + top_labels[2] +
-                    top_labels[3] + top_labels[4];
-      if (cnt_now < repair_min_ || cnt_now > repair_max_) break;
+      // Stop when no borderline neighbors remain OR count is unambiguous.
+      bool still_border = false;
+      int cnt_now = 0;
+      for (int j = 0; j < 5; j++) {
+        cnt_now += (top_labels[j] & 1);
+        if (top_labels[j] & 2) still_border = true;
+      }
+      if (!still_border || cnt_now < repair_min_ || cnt_now > repair_max_) break;
     }
   }
 };

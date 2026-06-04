@@ -568,7 +568,9 @@ static bool parse_references(const char *input, std::vector<int16_t> &vecs,
     }
     const char *lval = qopen + 1;
     bool is_fraud = (lval + 5 <= obj_end && memcmp(lval, "fraud", 5) == 0);
-    labels.push_back(is_fraud ? 1u : 0u);
+    const int16_t* v = vecs.data() + (vecs.size() - IVF_DIMS);
+    uint8_t lbl = (is_fraud ? 1u : 0u) | (is_borderline(v) ? 2u : 0u);
+    labels.push_back(lbl);
 
     p = obj_end + 1;
   }

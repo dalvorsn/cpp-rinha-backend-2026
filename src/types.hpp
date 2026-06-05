@@ -64,3 +64,27 @@ inline IndexLayout layout_for(uint32_t k, uint32_t total_blocks) {
 inline size_t block_pair_offset(int d, int lane) {
   return size_t(d / 2) * IVF_BLOCK * 2 + size_t(lane) * 2 + size_t(d & 1);
 }
+
+// Label encoding:
+//   bit 0 = fraud   (0=legit, 1=fraud)
+//   bit 1 = borderline (0=clear, 1=borderline region)
+//
+// int16 scale: value = round(normalized × 10000)
+//   q[0]=amount/10000  q[1]=installments/12  q[2]=(amount/avg)/10
+//   q[7]=km_home/1000  q[8]=tx_count_24h/20  q[11]=unknown_merchant
+//   q[12]=mcc_risk×10000  (safe: 1500/2000/2500/3000  risky: 7500/8000/8500)
+inline bool is_borderline(const int16_t* q) {
+  const bool safe_mcc =
+      (q[12] == 1500 || q[12] == 3000 || q[12] == 2000 || q[12] == 2500);
+  const bool obvious_legit = q[0] <= 500 && q[2] <= 500 && q[1] <= 2500 &&
+                             q[8] <= 2500 && q[7] <= 500 &&
+                             safe_mcc && q[11] == 0;
+  if (obvious_legit) return false;
+
+  const bool risky_mcc = (q[12] == 8500 || q[12] == 8000 || q[12] == 7500);
+  const bool obvious_fraud = q[0] >= 5000 && q[1] >= 4167 && q[8] >= 3000 &&
+                              q[7] >= 1500 && risky_mcc && q[11] == 10000;
+  if (obvious_fraud) return false;
+
+  return true;
+}
